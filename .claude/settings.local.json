@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mv /tmp/wp_links_clone/.git /opt/projects/wp_links/.git)",
+      "Bash(rmdir /tmp/wp_links_clone)"
+    ]
+  }
+}

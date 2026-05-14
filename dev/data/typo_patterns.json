@@ -1,0 +1,22 @@
+[
+  {"wrong": "articulo", "correct": "artículo", "context": "common missing accent"},
+  {"wrong": "tambien", "correct": "también", "context": "common missing accent"},
+  {"wrong": "asi", "correct": "así", "context": "common missing accent"},
+  {"wrong": "mas", "correct": "más", "context": "common missing accent on comparative"},
+  {"wrong": "numero", "correct": "número", "context": "common missing accent"},
+  {"wrong": "pagina", "correct": "página", "context": "common missing accent"},
+  {"wrong": "musica", "correct": "música", "context": "common missing accent"},
+  {"wrong": "politica", "correct": "política", "context": "common missing accent"},
+  {"wrong": "historica", "correct": "histórica", "context": "common missing accent"},
+  {"wrong": "economica", "correct": "económica", "context": "common missing accent"},
+  {"wrong": "tecnica", "correct": "técnica", "context": "common missing accent"},
+  {"wrong": "metodo", "correct": "método", "context": "common missing accent"},
+  {"wrong": "periodo", "correct": "período", "context": "common missing accent"},
+  {"wrong": "genero", "correct": "género", "context": "common missing accent"},
+  {"wrong": "codigo", "correct": "código", "context": "common missing accent"},
+  {"wrong": "trafico", "correct": "tráfico", "context": "common missing accent"},
+  {"wrong": "analisis", "correct": "análisis", "context": "common missing accent"},
+  {"wrong": "proposito", "correct": "propósito", "context": "common missing accent"},
+  {"wrong": "telefono", "correct": "teléfono", "context": "common missing accent"},
+  {"wrong": "vehiculo", "correct": "vehículo", "context": "common missing accent"}
+]
