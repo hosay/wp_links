@@ -9,6 +9,10 @@ For any non-trivial feature or fix, use a two-pass review cycle:
 
 Subagents read files and report findings only — never write code.
 
+## Project file layout
+
+All transient development files and documentation (notes, specs, research, scratch scripts, design docs, etc.) must live under `dev/` and its pertinent subdirectories (e.g. `dev/docs/`, `dev/scripts/`, `dev/research/`). Do not scatter these files in the project root or source directories.
+
 ## TDD strategy
 
 Always write a failing test first: write → confirm failure → implement → run full suite → refactor.
@@ -42,10 +46,3 @@ with Camoufox(headless=True) as browser:
 ```
 
 **`wait_until` strategy:** use `"networkidle"` for React-rendered login pages, `"load"` for all other pages (analytics scripts block `networkidle`), and `"domcontentloaded"` for simple pages needing no interaction.
-
-## Git / SSH
-
-Push uses the deploy key:
-```bash
-GIT_SSH_COMMAND="ssh -i /opt/projects/deploy_key -o StrictHostKeyChecking=no" git push origin main
-```
