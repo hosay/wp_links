@@ -49,8 +49,8 @@ def run_diagnostic(
 
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt, "--allowedTools", "Bash",
-             "--dangerouslySkipPermissions"],
+            ["claude", "-p", prompt, "--allowed-tools", "Bash",
+             "--dangerously-skip-permissions"],
             capture_output=True,
             text=True,
             timeout=DIAGNOSTIC_TIMEOUT,

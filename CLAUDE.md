@@ -46,3 +46,5 @@ with Camoufox(headless=True) as browser:
 ```
 
 **`wait_until` strategy:** use `"networkidle"` for React-rendered login pages, `"load"` for all other pages (analytics scripts block `networkidle`), and `"domcontentloaded"` for simple pages needing no interaction.
+
+**Residential proxies with geoip:** Use `geoip=True` with Camoufox to auto-spoof geolocation, timezone, locale, and WebRTC IP based on the proxy's location. Bright Data residential proxy creds are in `.env`.

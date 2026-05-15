@@ -40,7 +40,7 @@ def _type_human(page, selector: str, text: str):
 
 
 def build_edit_url(title: str) -> str:
-    return f"{BASE_URL}/w/index.php?title={title}&action=edit"
+    return f"{BASE_URL}/w/index.php?title={title}&action=edit&mobileaction=toggle_view_desktop"
 
 
 def build_raw_url(title: str) -> str:
@@ -97,7 +97,7 @@ def login(page, username: str, password: str) -> bool:
     """Login to es.wikipedia.org. Returns True on success."""
     login_url = f"{BASE_URL}/w/index.php?title=Especial:Entrar&returnto=Portada"
     log.info("Logging in as %s...", username)
-    page.goto(login_url, wait_until="networkidle")
+    page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
     _human_delay()
 
     _type_human(page, "#wpName1", username)
@@ -106,7 +106,10 @@ def login(page, username: str, password: str) -> bool:
     _human_delay(0.5, 1.0)
 
     page.click("#wpLoginAttempt")
-    page.wait_for_load_state("networkidle")
+    try:
+        page.wait_for_load_state("load", timeout=30000)
+    except Exception:
+        log.warning("Timeout waiting for login redirect — checking result anyway")
     _human_delay()
 
     # Check for block message before login verification
@@ -151,8 +154,31 @@ def save_edit(page, title: str, new_wikitext: str, summary: str) -> bool:
     """
     edit_url = build_edit_url(title)
     log.info("Opening edit page for %s", title)
-    page.goto(edit_url, wait_until="networkidle")
+    page.goto(edit_url, wait_until="domcontentloaded", timeout=60000)
     _human_delay()
+
+    # Dismiss any welcome dialogs (VisualEditor welcome, etc.)
+    for dismiss_sel in [
+        '.oo-ui-messageDialog .oo-ui-flaggedElement-primary button',
+        '.ve-init-mw-welcomeDialog button.oo-ui-flaggedElement-primary',
+        'button:has-text("Empezar")',
+        'button:has-text("Aceptar")',
+        '.oo-ui-window-active button',
+    ]:
+        try:
+            dismiss = page.query_selector(dismiss_sel)
+            if dismiss and dismiss.is_visible():
+                dismiss.click()
+                _human_delay(0.5, 1.0)
+                break
+        except Exception:
+            continue
+
+    # Use source editor URL to avoid VisualEditor entirely
+    if "action=edit" not in page.url:
+        source_url = build_edit_url(title) + "&action=edit&veswitched=1"
+        page.goto(source_url, wait_until="networkidle")
+        _human_delay()
 
     # Check if we can edit (not protected, not blocked)
     textarea = page.query_selector("#wpTextbox1")
@@ -193,8 +219,12 @@ def save_edit(page, title: str, new_wikitext: str, summary: str) -> bool:
         log.error("Save button not found for %s", title)
         return False
 
-    save_btn.click()
-    page.wait_for_load_state("networkidle")
+    # Use expect_navigation to handle the post-save redirect
+    try:
+        with page.expect_navigation(timeout=60000, wait_until="load"):
+            save_btn.click()
+    except Exception:
+        log.warning("Timeout waiting for navigation after save — checking result anyway")
     _human_delay()
 
     # Verify: should redirect to article view (not still on edit page)

@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     vpn_conf_path TEXT NOT NULL,
     fingerprint_json TEXT NOT NULL,
     profile_dir TEXT NOT NULL,
+    connection_type TEXT DEFAULT 'proxy',
+    connection_config TEXT DEFAULT '',
     edit_count INTEGER DEFAULT 0,
     state TEXT DEFAULT 'warmup',
     created_at TEXT,
@@ -81,11 +83,15 @@ def add_account(
     vpn_conf_path: str,
     fingerprint_json: str,
     profile_dir: str,
+    connection_type: str = "vpn",
+    connection_config: str = "",
 ) -> int:
     cur = conn.execute(
-        "INSERT INTO accounts (username, password, vpn_conf_path, fingerprint_json, profile_dir, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (username, password, vpn_conf_path, fingerprint_json, profile_dir, _now()),
+        "INSERT INTO accounts (username, password, vpn_conf_path, fingerprint_json, profile_dir, "
+        "connection_type, connection_config, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (username, password, vpn_conf_path, fingerprint_json, profile_dir,
+         connection_type, connection_config, _now()),
     )
     conn.commit()
     return cur.lastrowid
