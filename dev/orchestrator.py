@@ -353,23 +353,30 @@ def run(dry_run: bool = False):
             proxy_config = json.loads(account["connection_config"]) if account["connection_config"] else {}
 
             # Try proxy with full geo specificity, fall back to less specific on failure
-            browser = None
             proxy_attempts = _build_proxy_fallbacks(proxy_config, username)
+            working_proxy = None
             for attempt_label, proxy in proxy_attempts:
                 try:
-                    browser = create_browser(fingerprint, account["profile_dir"], proxy=proxy)
-                    log.info("Proxy connected: %s", attempt_label)
+                    # Quick validation: test proxy connectivity before launching browser
+                    from dev.account_creator import PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS
+                    import requests as _req
+                    test_proxy_url = f"http://{proxy['username']}:{proxy['password']}@{PROXY_HOST}:{PROXY_PORT}" if proxy else None
+                    if test_proxy_url:
+                        _req.get("http://httpbin.org/ip",
+                                 proxies={"http": test_proxy_url, "https": test_proxy_url},
+                                 timeout=8)
+                    working_proxy = proxy
+                    log.info("Proxy validated: %s", attempt_label)
                     break
                 except Exception as proxy_exc:
-                    if "InvalidProxy" in type(proxy_exc).__name__ or "Proxy" in str(proxy_exc):
-                        log.warning("Proxy failed (%s): %s — trying next fallback", attempt_label, proxy_exc)
-                        continue
-                    raise  # Non-proxy error, don't retry
+                    log.warning("Proxy failed (%s): %s — trying next fallback",
+                                attempt_label, str(proxy_exc)[:100])
+                    continue
 
-            if browser is None:
+            if working_proxy is None and proxy_config:
                 raise RuntimeError(f"All proxy fallbacks failed for {username}")
 
-            with browser:
+            with create_browser(fingerprint, account["profile_dir"], proxy=working_proxy) as browser:
                 page = browser.new_page()
 
                 # Login
