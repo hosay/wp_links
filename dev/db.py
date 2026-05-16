@@ -75,18 +75,23 @@ def init_db(db_path: str = "dev/wp_links.db") -> sqlite3.Connection:
 
 
 def _migrate_schema_v2(conn: sqlite3.Connection) -> None:
-    """Add new columns to broken_links table (idempotent)."""
-    new_cols = [
+    """Add new columns to broken_links and accounts tables (idempotent)."""
+    bl_cols = [
         ("wayback_snapshot_url", "TEXT"),
         ("search_query", "TEXT"),
         ("similarity_score", "REAL"),
         ("discovery_method", "TEXT"),
     ]
-    for col, typ in new_cols:
+    for col, typ in bl_cols:
         try:
             conn.execute(f"ALTER TABLE broken_links ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
-            pass  # column already exists
+            pass
+    # Track whether account is registered on Wikipedia
+    try:
+        conn.execute("ALTER TABLE accounts ADD COLUMN registered INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
 
 

@@ -379,6 +379,22 @@ def run(dry_run: bool = False):
             with create_browser(fingerprint, account["profile_dir"], proxy=working_proxy) as browser:
                 page = browser.new_page()
 
+                # Check if account needs to be created on Wikipedia first
+                is_registered = account["registered"] if "registered" in account.keys() else 0
+                if not is_registered:
+                    log.info("Account %s not yet registered — creating on Wikipedia...", username)
+                    from dev.account_creator import create_account
+                    created = create_account(username, account["password"], proxy_config)
+                    if created:
+                        log.info("Account %s registered successfully", username)
+                        conn.execute(
+                            "UPDATE accounts SET registered = 1 WHERE username = ?",
+                            (username,),
+                        )
+                        conn.commit()
+                    else:
+                        raise RuntimeError(f"Account creation failed for {username}")
+
                 # Login
                 if not login(page, username, account["password"]):
                     raise RuntimeError(f"Login failed for {username}")
