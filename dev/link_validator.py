@@ -34,6 +34,15 @@ _SUMMARY_TEMPLATES_WAYBACK = [
     "Actualizar enlace muerto con copia de Wayback Machine",
 ]
 
+_SUMMARY_TEMPLATES_GOOGLE = [
+    "Corregir enlace roto: URL actualizada",
+    "Enlace externo roto reemplazado por nueva ubicación",
+    "Actualizar enlace roto — contenido migrado",
+    "Corrección de enlace externo roto (nueva URL)",
+    "Enlace roto: fuente reubicada",
+    "Reparar enlace inaccesible con URL vigente",
+]
+
 _SUMMARY_TEMPLATES_GENERAL = [
     "Corregir enlace externo roto",
     "Enlace roto actualizado",
@@ -111,7 +120,12 @@ def parse_wayback_response(data: dict) -> dict | None:
     }
 
 
-def classify_confidence(original_url: str, replacement_url: str, source: str) -> str:
+def classify_confidence(
+    original_url: str,
+    replacement_url: str,
+    source: str,
+    similarity_score: float = 0.0,
+) -> str:
     """Classify the confidence level of a replacement URL.
 
     Returns: 'high', 'medium', or 'low'.
@@ -121,6 +135,16 @@ def classify_confidence(original_url: str, replacement_url: str, source: str) ->
     if source == "redirect" and same_org:
         return "high"
     if source == "redirect" and not same_org:
+        return "medium"
+    if source == "google_phrase_match" and same_org:
+        return "high"
+    if source == "google_phrase_match" and similarity_score >= 0.85:
+        return "high"
+    if source == "google_phrase_match" and similarity_score >= 0.6:
+        return "medium"
+    if source == "google_title_search" and same_org and similarity_score >= 0.7:
+        return "high"
+    if source == "google_title_search" and similarity_score >= 0.6:
         return "medium"
     if source == "wayback":
         return "medium"
@@ -142,6 +166,8 @@ def generate_edit_summary(source: str, old_url: str, new_url: str) -> str:
         templates = _SUMMARY_TEMPLATES_REDIRECT
     elif source == "wayback":
         templates = _SUMMARY_TEMPLATES_WAYBACK
+    elif source in ("google_phrase_match", "google_title_search"):
+        templates = _SUMMARY_TEMPLATES_GOOGLE
     else:
         templates = _SUMMARY_TEMPLATES_GENERAL
 

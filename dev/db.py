@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     connection_type TEXT DEFAULT 'proxy',
     connection_config TEXT DEFAULT '',
     edit_count INTEGER DEFAULT 0,
-    state TEXT DEFAULT 'warmup',
+    state TEXT DEFAULT 'pending',
     created_at TEXT,
     last_edit_at TEXT
 );
@@ -70,7 +70,24 @@ def init_db(db_path: str = "dev/wp_links.db") -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
     conn.commit()
+    _migrate_schema_v2(conn)
     return conn
+
+
+def _migrate_schema_v2(conn: sqlite3.Connection) -> None:
+    """Add new columns to broken_links table (idempotent)."""
+    new_cols = [
+        ("wayback_snapshot_url", "TEXT"),
+        ("search_query", "TEXT"),
+        ("similarity_score", "REAL"),
+        ("discovery_method", "TEXT"),
+    ]
+    for col, typ in new_cols:
+        try:
+            conn.execute(f"ALTER TABLE broken_links ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    conn.commit()
 
 
 # ── accounts ──────────────────────────────────────────────────────────
@@ -80,18 +97,19 @@ def add_account(
     conn: sqlite3.Connection,
     username: str,
     password: str,
-    vpn_conf_path: str,
     fingerprint_json: str,
     profile_dir: str,
-    connection_type: str = "vpn",
+    connection_type: str = "proxy",
     connection_config: str = "",
+    vpn_conf_path: str = "",
+    state: str = "pending",
 ) -> int:
     cur = conn.execute(
         "INSERT INTO accounts (username, password, vpn_conf_path, fingerprint_json, profile_dir, "
-        "connection_type, connection_config, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "connection_type, connection_config, state, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (username, password, vpn_conf_path, fingerprint_json, profile_dir,
-         connection_type, connection_config, _now()),
+         connection_type, connection_config, state, _now()),
     )
     conn.commit()
     return cur.lastrowid
@@ -128,6 +146,12 @@ def increment_edit_count(conn: sqlite3.Connection, username: str) -> None:
 
 
 def add_page(conn: sqlite3.Connection, wiki_title: str, found_via: str) -> int:
+    """Insert a page, deduplicating by wiki_title."""
+    existing = conn.execute(
+        "SELECT id FROM pages WHERE wiki_title = ?", (wiki_title,)
+    ).fetchone()
+    if existing:
+        return existing["id"]
     cur = conn.execute(
         "INSERT INTO pages (wiki_title, found_via, created_at) VALUES (?, ?, ?)",
         (wiki_title, found_via, _now()),
@@ -155,6 +179,15 @@ def mark_page_done(conn: sqlite3.Connection, page_id: int) -> None:
     conn.commit()
 
 
+def mark_page_unclaimed(conn: sqlite3.Connection, page_id: int) -> None:
+    """Revert a page to pending so it can be retried on the next run."""
+    conn.execute(
+        "UPDATE pages SET status = 'pending', claimed_by_account = NULL WHERE id = ?",
+        (page_id,),
+    )
+    conn.commit()
+
+
 # ── broken_links ──────────────────────────────────────────────────────
 
 
@@ -164,11 +197,19 @@ def add_broken_link(
     original_url: str,
     link_status: int,
     source: str,
+    discovery_method: str | None = None,
 ) -> int:
+    """Insert a broken link with dedup on (page_id, original_url)."""
+    existing = conn.execute(
+        "SELECT id FROM broken_links WHERE page_id = ? AND original_url = ?",
+        (page_id, original_url),
+    ).fetchone()
+    if existing:
+        return existing["id"]
     cur = conn.execute(
-        "INSERT INTO broken_links (page_id, original_url, link_status, source, verified_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (page_id, original_url, link_status, source, _now()),
+        "INSERT INTO broken_links (page_id, original_url, link_status, source, "
+        "discovery_method, verified_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (page_id, original_url, link_status, source, discovery_method, _now()),
     )
     conn.commit()
     return cur.lastrowid
@@ -178,8 +219,33 @@ def get_fixable_links(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT bl.*, p.wiki_title FROM broken_links bl "
         "JOIN pages p ON bl.page_id = p.id "
-        "WHERE bl.replacement_url IS NOT NULL AND bl.confidence = 'high'"
+        "WHERE bl.replacement_url IS NOT NULL AND bl.confidence IN ('high', 'medium')"
     ).fetchall()
+
+
+def get_broken_links_needing_replacement(
+    conn: sqlite3.Connection, limit: int = 50
+) -> list[sqlite3.Row]:
+    """Get broken links that haven't been searched yet.
+
+    Skips links where search_query is set (already searched, no result found).
+    """
+    return conn.execute(
+        "SELECT bl.*, p.wiki_title FROM broken_links bl "
+        "JOIN pages p ON bl.page_id = p.id "
+        "WHERE bl.replacement_url IS NULL AND bl.search_query IS NULL "
+        "ORDER BY bl.verified_at ASC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def mark_link_searched(conn: sqlite3.Connection, broken_link_id: int, query: str) -> None:
+    """Mark a broken link as searched (no replacement found)."""
+    conn.execute(
+        "UPDATE broken_links SET search_query = ?, verified_at = ? WHERE id = ?",
+        (query, _now(), broken_link_id),
+    )
+    conn.commit()
 
 
 def set_replacement_url(
@@ -241,6 +307,47 @@ def get_edits_for_account(conn: sqlite3.Connection, account_id: int) -> list[sql
 
 
 # ── reporting ─────────────────────────────────────────────────────────
+
+
+def get_health_metrics(conn: sqlite3.Connection, days: int = 7) -> dict:
+    """Get edit health metrics for the last N days."""
+    from datetime import datetime, timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    total = conn.execute(
+        "SELECT COUNT(*) as c FROM edits WHERE attempted_at >= ?", (cutoff,)
+    ).fetchone()["c"]
+    reverted = conn.execute(
+        "SELECT COUNT(*) as c FROM edits WHERE attempted_at >= ? AND status = 'reverted'",
+        (cutoff,),
+    ).fetchone()["c"]
+    return {
+        "total_7d": total,
+        "reverted_7d": reverted,
+        "admin_warnings": 0,  # TODO: implement warning detection
+    }
+
+
+def get_account_pipeline_summary(conn: sqlite3.Connection) -> dict:
+    """Get account lifecycle summary for reporting."""
+    total = conn.execute("SELECT COUNT(*) as c FROM accounts").fetchone()["c"]
+    warmup = conn.execute("SELECT COUNT(*) as c FROM accounts WHERE state = 'warmup'").fetchone()["c"]
+    active = conn.execute("SELECT COUNT(*) as c FROM accounts WHERE state = 'active'").fetchone()["c"]
+    pending = conn.execute("SELECT COUNT(*) as c FROM accounts WHERE state = 'pending'").fetchone()["c"]
+    blocked = conn.execute(
+        "SELECT COUNT(*) as c FROM accounts WHERE state IN ('blocked', 'suspended')"
+    ).fetchone()["c"]
+    avg_row = conn.execute(
+        "SELECT AVG(edit_count) as avg FROM accounts WHERE state = 'warmup'"
+    ).fetchone()
+    avg_warmup = round(avg_row["avg"], 1) if avg_row["avg"] else 0.0
+    return {
+        "total": total,
+        "warmup_count": warmup,
+        "active_count": active,
+        "pending_count": pending,
+        "blocked_count": blocked,
+        "avg_warmup_progress": avg_warmup,
+    }
 
 
 def get_daily_summary(conn: sqlite3.Connection) -> dict:

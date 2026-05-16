@@ -104,3 +104,53 @@ def test_generate_edit_summary_varies():
         summaries.add(s)
     # With randomisation, we expect at least 2 distinct summaries in 10 tries
     assert len(summaries) >= 2
+
+
+# ── new source types ─────────────────────────────────────────────────
+
+
+def test_classify_confidence_google_phrase_match_same_org():
+    assert classify_confidence(
+        "http://old.gob.mx/doc", "http://new.gob.mx/doc",
+        "google_phrase_match", similarity_score=0.6,
+    ) == "high"
+
+
+def test_classify_confidence_google_phrase_match_high_similarity():
+    assert classify_confidence(
+        "http://old.gob.mx/doc", "http://different.com/doc",
+        "google_phrase_match", similarity_score=0.9,
+    ) == "high"
+
+
+def test_classify_confidence_google_phrase_match_medium_similarity():
+    assert classify_confidence(
+        "http://old.gob.mx/doc", "http://different.com/doc",
+        "google_phrase_match", similarity_score=0.7,
+    ) == "medium"
+
+
+def test_classify_confidence_google_title_search_same_org():
+    assert classify_confidence(
+        "http://old.gob.mx/doc", "http://new.gob.mx/doc",
+        "google_title_search", similarity_score=0.75,
+    ) == "high"
+
+
+def test_classify_confidence_google_title_search_medium():
+    assert classify_confidence(
+        "http://old.com/doc", "http://other.org/doc",
+        "google_title_search", similarity_score=0.65,
+    ) == "medium"
+
+
+def test_generate_edit_summary_google_phrase_match():
+    s = generate_edit_summary("google_phrase_match", "http://dead.com/x", "http://new.com/x")
+    assert isinstance(s, str)
+    assert len(s) > 5
+
+
+def test_generate_edit_summary_google_title_search():
+    s = generate_edit_summary("google_title_search", "http://dead.com/x", "http://new.com/x")
+    assert isinstance(s, str)
+    assert len(s) > 5

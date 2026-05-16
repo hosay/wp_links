@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 echo "=========================================="
-echo "$(date -Iseconds) — Starting daily edit cycle"
+echo "$(date -Iseconds) — Daily edit cycle triggered"
 echo "=========================================="
 
 cd "$PROJECT_DIR"
@@ -19,6 +19,12 @@ set -a
 source .env
 set +a
 
+# Random startup delay (0-90 min) so edits don't always happen at exactly 02:00
+DELAY=$(( RANDOM % 5400 ))
+echo "$(date -Iseconds) — Waiting ${DELAY}s before starting..."
+sleep "$DELAY"
+
+echo "$(date -Iseconds) — Starting daily edit cycle"
 python -m dev.orchestrator
 
 echo "$(date -Iseconds) — Daily edit cycle finished"

@@ -14,6 +14,7 @@ import random
 import re
 import time
 
+import requests as http_requests
 from lxml import html as lxml_html
 
 log = logging.getLogger(__name__)
@@ -162,6 +163,152 @@ def find_broken_links_in_article(page, title: str) -> list[str]:
     from dev.wiki_browser import get_wikitext
     wikitext = get_wikitext(page, title)
     return extract_broken_urls_from_wikitext(wikitext)
+
+
+# ── v2 template parsing ──────────────────────────────────────────────
+
+
+_CITA_WEB_DEAD_RE = re.compile(
+    r'\{\{cita web\b[^}]*?\|url\s*=\s*(https?://[^\s\|\}]+)[^}]*?'
+    r'(?:\|urlmuerta\s*=\s*s[ií]|\|estado\s*=\s*muerto)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+_CITE_WEB_DEAD_RE = re.compile(
+    r'\{\{cite web\b[^}]*?\|url\s*=\s*(https?://[^\s\|\}]+)[^}]*?'
+    r'(?:\|dead-url\s*=\s*yes|\|url-status\s*=\s*dead)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+_URL_INACCESIBLE_RE = re.compile(
+    r'\{\{URL inaccesible\s*\|(?:url\s*=\s*|1\s*=\s*)?(https?://[^\s\|\}]+)',
+    re.IGNORECASE,
+)
+
+
+def extract_broken_urls_v2(wikitext: str) -> list[dict]:
+    """Extract broken URLs from multiple template types.
+
+    Detects:
+    - {{enlace roto|url=...}}
+    - {{cita web|url=...|urlmuerta=sí}} or |estado=muerto
+    - {{URL inaccesible|url=...}} or {{URL inaccesible|1=...}}
+    - {{cite web|url=...|dead-url=yes}} or |url-status=dead
+
+    Returns list of {"url": str, "template": str} dicts (deduped by url).
+    """
+    results = []
+    seen_urls = set()
+
+    def _add(url: str, template: str):
+        if url not in seen_urls:
+            seen_urls.add(url)
+            results.append({"url": url, "template": template})
+
+    # {{enlace roto}} — existing pattern
+    for match in _ENLACE_ROTO_RE.finditer(wikitext):
+        template_text = match.group(0)
+        url_match = _URL_IN_TEMPLATE_RE.search(template_text)
+        if url_match:
+            _add(url_match.group(1), "enlace_roto")
+        else:
+            # Grab URL from same line
+            line_start = wikitext.rfind("\n", 0, match.start()) + 1
+            line_end = wikitext.find("\n", match.end())
+            if line_end == -1:
+                line_end = len(wikitext)
+            line = wikitext[line_start:line_end]
+            urls_on_line = re.findall(r'https?://[^\s\]\|\}<>"]+', line)
+            for url in urls_on_line:
+                _add(url, "enlace_roto")
+
+    # {{cita web|url=...|urlmuerta=sí}} or |estado=muerto
+    for match in _CITA_WEB_DEAD_RE.finditer(wikitext):
+        _add(match.group(1), "cita_web")
+
+    # {{cite web|url=...|dead-url=yes}} or |url-status=dead
+    for match in _CITE_WEB_DEAD_RE.finditer(wikitext):
+        _add(match.group(1), "cite_web")
+
+    # {{URL inaccesible}}
+    for match in _URL_INACCESIBLE_RE.finditer(wikitext):
+        _add(match.group(1), "url_inaccesible")
+
+    return results
+
+
+# ── API-based discovery ──────────────────────────────────────────────
+
+
+_API_URL = "https://es.wikipedia.org/w/api.php"
+_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"
+
+
+def fetch_category_members_api(
+    category: str = "Wikipedia:Artículos_con_enlaces_externos_rotos",
+    limit: int = 500,
+    cmcontinue: str | None = None,
+) -> tuple[list[str], str | None]:
+    """Fetch article titles from a category via MediaWiki API.
+
+    Returns (list_of_titles, continue_token_or_None).
+    """
+    params = {
+        "action": "query",
+        "list": "categorymembers",
+        "cmtitle": f"Categoría:{category}",
+        "cmlimit": limit,
+        "cmnamespace": 0,
+        "format": "json",
+    }
+    if cmcontinue:
+        params["cmcontinue"] = cmcontinue
+
+    resp = http_requests.get(_API_URL, params=params, timeout=15, headers={"User-Agent": _UA})
+    resp.raise_for_status()
+    data = resp.json()
+
+    members = data.get("query", {}).get("categorymembers", [])
+    titles = [m["title"] for m in members]
+
+    cont = data.get("continue", {}).get("cmcontinue")
+    return titles, cont
+
+
+def fetch_wikitext_batch_api(titles: list[str], batch_size: int = 50) -> dict[str, str]:
+    """Fetch wikitext for multiple articles in batched API calls.
+
+    Returns {title: wikitext} dict.
+    """
+    result = {}
+    for i in range(0, len(titles), batch_size):
+        batch = titles[i:i + batch_size]
+        params = {
+            "action": "query",
+            "prop": "revisions",
+            "rvprop": "content",
+            "titles": "|".join(batch),
+            "format": "json",
+            "rvslots": "main",
+        }
+        resp = http_requests.get(_API_URL, params=params, timeout=30, headers={"User-Agent": _UA})
+        resp.raise_for_status()
+        data = resp.json()
+
+        pages = data.get("query", {}).get("pages", {})
+        for page_data in pages.values():
+            title = page_data.get("title", "")
+            revisions = page_data.get("revisions", [])
+            if revisions:
+                # Handle both slot-based and legacy response formats
+                rev = revisions[0]
+                if "slots" in rev:
+                    content = rev["slots"].get("main", {}).get("*", "")
+                else:
+                    content = rev.get("*", "")
+                result[title] = content
+
+    return result
 
 
 def fetch_semrush_broken_links(page, domain: str = "es.wikipedia.org") -> list[dict]:

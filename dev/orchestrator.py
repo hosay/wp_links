@@ -1,6 +1,6 @@
 """Daily edit orchestrator.
 
-Selects accounts, rotates VPNs, executes edits (typo or link fix),
+Selects accounts, executes edits (typo or link fix) via residential proxy,
 records results, and reports to Slack. Mirrors the pattern from
 /opt/projects/xflippa/dev/run_with_notify.py.
 
@@ -9,6 +9,7 @@ Usage:
     python -m dev.orchestrator --dry    # dry run (no actual edits)
 """
 
+import json
 import logging
 import os
 import random
@@ -22,6 +23,8 @@ from dev.db import (
     init_db,
     get_account,
     get_accounts_by_state,
+    get_account_pipeline_summary,
+    get_health_metrics,
     update_account_state,
     increment_edit_count,
     add_page,
@@ -32,6 +35,7 @@ from dev.db import (
     add_edit,
     update_edit_status,
     get_daily_summary,
+    mark_page_unclaimed,
 )
 from dev.diagnostics import run_diagnostic
 from dev.edit_engine import (
@@ -40,21 +44,28 @@ from dev.edit_engine import (
     apply_typo_fix,
     apply_link_fix,
     pick_typo_edit_summary,
+    search_articles_with_typo,
+    find_double_spaces,
+    apply_spacing_fix,
+    pick_spacing_edit_summary,
 )
+from dev.account_creator import build_proxy
 from dev.fingerprint import load_fingerprint
+from dev.discovery import discover_broken_links
 from dev.link_finder import find_broken_links_in_article, fetch_dead_links_category
 from dev.link_validator import (
     find_replacement,
     classify_confidence,
     generate_edit_summary,
 )
+from dev.link_replacer import get_usage_stats, reset_usage_stats
 from dev.slack_notifier import (
     format_daily_summary,
+    format_edit_report,
     format_error_message,
     format_diagnostic_message,
     send_notification,
 )
-from dev.vpn import vpn_session
 from dev.wiki_browser import (
     create_browser,
     login,
@@ -110,49 +121,95 @@ def select_daily_accounts(conn, count: int = 4) -> list:
 
 
 def determine_edit_type(state: str, edit_count: int) -> str:
-    """Determine what type of edit an account should make."""
+    """Determine what type of edit an account should make.
+
+    During warmup, alternates between typo and spacing fixes to look natural.
+    Typo fix on odd edit counts, spacing fix on even — ensures variety across
+    the 5-edit warmup period.
+    """
     if state == "warmup":
-        return "typo"
+        return "typo" if edit_count % 2 == 0 else "spacing"
     return "link_fix"
 
 
 def should_transition_state(state: str, edit_count: int) -> bool:
     """Check if an account should transition from warmup to active."""
-    return state == "warmup" and edit_count >= 2
+    return state == "warmup" and edit_count >= 5
 
 
 # ── edit execution ────────────────────────────────────────────────────
 
 
 def execute_typo_edit(page, conn, account) -> dict:
-    """Execute a typo fix edit on a random article."""
+    """Execute a typo fix edit using MediaWiki API to find a suitable article."""
     patterns = load_typo_patterns()
-    max_attempts = 5
+    random.shuffle(patterns)  # vary which typo we target each run
 
-    for attempt in range(max_attempts):
+    for pattern in patterns:
+        candidates = search_articles_with_typo(pattern["wrong"], limit=20)
+        if not candidates:
+            continue
+
+        random.shuffle(candidates)
+        for title in candidates[:10]:
+            wikitext = get_wikitext(page, title)
+            match = find_typo_in_text(wikitext, patterns)
+            if not match:
+                log.info("No typo confirmed in %s (false positive from API), skipping", title)
+                time.sleep(random.uniform(1, 3))
+                continue
+
+            fixed_text, count = apply_typo_fix(wikitext, match["wrong"], match["correct"])
+            summary = pick_typo_edit_summary()
+
+            # Record in DB
+            page_id = add_page(conn, wiki_title=title, found_via="random")
+            claim_page(conn, page_id, account["id"])
+            edit_id = add_edit(
+                conn,
+                account_id=account["id"],
+                page_id=page_id,
+                edit_type="typo",
+                diff_summary=f"{match['wrong']} -> {match['correct']} ({count}x)",
+            )
+
+            success = save_edit(page, title, fixed_text, summary)
+            if success:
+                update_edit_status(conn, edit_id, status="success")
+                mark_page_done(conn, page_id)
+                return {"success": True, "title": title, "edit_id": edit_id}
+            else:
+                update_edit_status(conn, edit_id, status="failed",
+                                 error_message="save_edit returned False")
+                mark_page_unclaimed(conn, page_id)
+                return {"success": False, "title": title, "edit_id": edit_id}
+
+    return {"success": False, "title": None, "error": "No typo found after exhausting all patterns"}
+
+
+def execute_spacing_edit(page, conn, account) -> dict:
+    """Fix double spaces in a random article (warmup variety edit)."""
+    max_attempts = 15
+    for _ in range(max_attempts):
         title = get_random_article_title(page)
         if not title:
             continue
-
         wikitext = get_wikitext(page, title)
-        match = find_typo_in_text(wikitext, patterns)
-        if not match:
-            log.info("No typo found in %s, trying another article...", title)
-            time.sleep(random.uniform(2, 4))
+        if not find_double_spaces(wikitext):
+            time.sleep(random.uniform(1, 3))
             continue
 
-        fixed_text, count = apply_typo_fix(wikitext, match["wrong"], match["correct"])
-        summary = pick_typo_edit_summary()
+        fixed_text, count = apply_spacing_fix(wikitext)
+        summary = pick_spacing_edit_summary()
 
-        # Record in DB
         page_id = add_page(conn, wiki_title=title, found_via="random")
         claim_page(conn, page_id, account["id"])
         edit_id = add_edit(
             conn,
             account_id=account["id"],
             page_id=page_id,
-            edit_type="typo",
-            diff_summary=f"{match['wrong']} -> {match['correct']} ({count}x)",
+            edit_type="spacing",
+            diff_summary=f"double spaces removed ({count}x)",
         )
 
         success = save_edit(page, title, fixed_text, summary)
@@ -162,10 +219,11 @@ def execute_typo_edit(page, conn, account) -> dict:
             return {"success": True, "title": title, "edit_id": edit_id}
         else:
             update_edit_status(conn, edit_id, status="failed",
-                             error_message="save_edit returned False")
+                               error_message="save_edit returned False")
+            mark_page_unclaimed(conn, page_id)
             return {"success": False, "title": title, "edit_id": edit_id}
 
-    return {"success": False, "title": None, "error": "No typo found after max attempts"}
+    return {"success": False, "title": None, "error": "No double-space article found after max attempts"}
 
 
 def execute_link_fix(page, conn, account) -> dict:
@@ -173,38 +231,14 @@ def execute_link_fix(page, conn, account) -> dict:
     # Get a fixable link from the DB
     fixable = get_fixable_links(conn)
     if not fixable:
-        log.warning("No fixable links available — falling back to discovery")
-        # Try to discover broken links on the fly
-        results = fetch_dead_links_category(page, max_pages=1)
-        if not results:
-            return {"success": False, "error": "No broken links found"}
-
-        # Check the first result for a broken link
-        for result in results[:3]:
-            title = result["wiki_title"]
-            broken_urls = find_broken_links_in_article(page, title)
-            if broken_urls:
-                for url in broken_urls[:2]:
-                    replacement = find_replacement(page, url)
-                    if replacement:
-                        from dev.db import add_broken_link, set_replacement_url
-                        page_id = add_page(conn, wiki_title=title, found_via="wp_report")
-                        bl_id = add_broken_link(conn, page_id, url, 404, "wp_report")
-                        confidence = classify_confidence(
-                            url, replacement["replacement_url"], replacement["source"]
-                        )
-                        if confidence == "high":
-                            set_replacement_url(
-                                conn, bl_id, replacement["replacement_url"],
-                                confidence, replacement["source"]
-                            )
-                            fixable = get_fixable_links(conn)
-                            break
-            if fixable:
-                break
+        log.warning("No fixable links available — running discovery")
+        # Run discovery pipeline (uses API + Google Search, no Camoufox needed)
+        stats = discover_broken_links(conn, max_articles=20)
+        log.info("Discovery found %d replacements", stats.get("replacements_found", 0))
+        fixable = get_fixable_links(conn)
 
     if not fixable:
-        return {"success": False, "error": "No high-confidence replacements found"}
+        return {"success": False, "error": "No fixable replacements found after discovery"}
 
     # Pick one
     link = fixable[0]
@@ -239,6 +273,7 @@ def execute_link_fix(page, conn, account) -> dict:
     else:
         update_edit_status(conn, edit_id, status="failed",
                          error_message="save_edit returned False")
+        mark_page_unclaimed(conn, page_id)
         return {"success": False, "title": title, "edit_id": edit_id}
 
 
@@ -249,7 +284,8 @@ def run(dry_run: bool = False):
     """Execute the daily edit cycle."""
     log.info("=== Starting daily edit cycle ===")
     conn = init_db(DB_PATH)
-    accounts = select_daily_accounts(conn, count=4)
+    daily_count = random.randint(2, 5)
+    accounts = select_daily_accounts(conn, count=daily_count)
 
     if not accounts:
         log.error("No eligible accounts — aborting")
@@ -260,6 +296,9 @@ def run(dry_run: bool = False):
         return
 
     accounts_used = []
+    edit_records = []  # Track all edits for reporting
+    reset_usage_stats()
+
     for i, account in enumerate(accounts):
         username = account["username"]
         log.info("--- Account %d/%d: %s ---", i + 1, len(accounts), username)
@@ -270,56 +309,65 @@ def run(dry_run: bool = False):
             continue
 
         try:
-            # Load fingerprint
+            # Load fingerprint and proxy config
             fingerprint = load_fingerprint(username, PROFILES_DIR)
-            vpn_conf = account["vpn_conf_path"]
+            proxy_config = json.loads(account["connection_config"]) if account["connection_config"] else {}
+            proxy = build_proxy(proxy_config, session_id=username) if proxy_config else None
 
-            with vpn_session(vpn_conf):
-                with create_browser(fingerprint, account["profile_dir"]) as browser:
-                    page = browser.new_page()
+            with create_browser(fingerprint, account["profile_dir"], proxy=proxy) as browser:
+                page = browser.new_page()
 
-                    # Login
-                    if not login(page, username, account["password"]):
-                        # Check if account might be blocked
-                        page_content = page.content().lower()
-                        if any(m in page_content for m in ["bloqueado", "blocked"]):
-                            log.error("Account %s is BLOCKED — marking as blocked", username)
-                            update_account_state(conn, username, "blocked")
-                            send_notification(
-                                f":no_entry: *Account blocked*: {username}",
-                                WEBHOOK_URL,
-                            )
-                            continue
-                        raise RuntimeError(f"Login failed for {username}")
+                # Login
+                if not login(page, username, account["password"]):
+                    raise RuntimeError(f"Login failed for {username}")
 
-                    # Determine edit type
-                    edit_type = determine_edit_type(account["state"], account["edit_count"])
-                    log.info("Edit type for %s: %s", username, edit_type)
+                # Determine edit type
+                edit_type = determine_edit_type(account["state"], account["edit_count"])
+                log.info("Edit type for %s: %s", username, edit_type)
 
-                    # Execute edit
-                    if edit_type == "typo":
-                        result = execute_typo_edit(page, conn, account)
-                    else:
-                        result = execute_link_fix(page, conn, account)
+                # Execute edit
+                if edit_type == "typo":
+                    result = execute_typo_edit(page, conn, account)
+                elif edit_type == "spacing":
+                    result = execute_spacing_edit(page, conn, account)
+                else:
+                    result = execute_link_fix(page, conn, account)
 
-                    if result.get("success"):
-                        log.info("Edit successful for %s on %s", username, result.get("title"))
-                        increment_edit_count(conn, username)
+                # Record for reporting
+                edit_time = datetime.now(timezone.utc).strftime("%H:%M")
+                title = result.get("title", "N/A")
+                status = "success" if result.get("success") else "failed"
+                revision_id = result.get("revision_id")
+                error_msg = result.get("error", "") if not result.get("success") else ""
 
-                        # Check state transition
-                        updated = get_account(conn, username)
-                        if should_transition_state(updated["state"], updated["edit_count"]):
-                            update_account_state(conn, username, "active")
-                            log.info("Account %s transitioned to active", username)
-                    else:
-                        error = result.get("error", "Unknown error")
-                        log.error("Edit failed for %s: %s", username, error)
-                        send_notification(
-                            format_error_message(username, error, edit_type),
-                            WEBHOOK_URL,
-                        )
+                edit_records.append({
+                    "account": username,
+                    "time": edit_time,
+                    "edit_type": edit_type,
+                    "title": title or "N/A",
+                    "status": status,
+                    "revision_id": revision_id,
+                    "error_message": error_msg,
+                })
 
-                    accounts_used.append(username)
+                if result.get("success"):
+                    log.info("Edit successful for %s on %s", username, title)
+                    increment_edit_count(conn, username)
+
+                    # Check state transition
+                    updated = get_account(conn, username)
+                    if should_transition_state(updated["state"], updated["edit_count"]):
+                        update_account_state(conn, username, "active")
+                        log.info("Account %s transitioned to active", username)
+                else:
+                    error = result.get("error", "Unknown error")
+                    log.error("Edit failed for %s: %s", username, error)
+                    send_notification(
+                        format_error_message(username, error, edit_type),
+                        WEBHOOK_URL,
+                    )
+
+                accounts_used.append(username)
 
         except Exception as exc:
             error_str = str(exc)
@@ -339,17 +387,25 @@ def run(dry_run: bool = False):
                 WEBHOOK_URL,
             )
 
-        # Random delay between accounts (5-15 min)
+        # Random delay between accounts (1-90 min) for organic timing
         if i < len(accounts) - 1:
-            delay = random.uniform(300, 900)
-            log.info("Waiting %.0f seconds before next account...", delay)
+            delay = random.uniform(60, 5400)
+            log.info("Waiting %.0f seconds (%.1f min) before next account...", delay, delay / 60)
             time.sleep(delay)
 
-    # Daily summary
-    summary = get_daily_summary(conn)
-    msg = format_daily_summary(summary, accounts_used)
-    log.info("Daily summary:\n%s", msg)
-    send_notification(msg, WEBHOOK_URL)
+    # Send detailed edit report
+    usage = get_usage_stats()
+    account_summary = get_account_pipeline_summary(conn)
+    health = get_health_metrics(conn)
+    fixable = get_fixable_links(conn)
+    report = format_edit_report(
+        edit_records, accounts_used, usage,
+        account_summary=account_summary,
+        fixable_count=len(fixable),
+        health=health,
+    )
+    log.info("Edit report:\n%s", report)
+    send_notification(report, WEBHOOK_URL)
 
     conn.close()
     log.info("=== Daily edit cycle complete ===")
