@@ -277,6 +277,45 @@ def execute_link_fix(page, conn, account) -> dict:
         return {"success": False, "title": title, "edit_id": edit_id}
 
 
+# ── proxy fallback ───────────────────────────────────────────────────
+
+
+def _build_proxy_fallbacks(proxy_config: dict, username: str) -> list[tuple[str, dict | None]]:
+    """Build a list of proxy configs with decreasing geo specificity.
+
+    If city-level proxy is unavailable, try region-only, then country-only.
+    Returns list of (label, proxy_dict) tuples.
+    """
+    if not proxy_config:
+        return [("no proxy", None)]
+
+    fallbacks = []
+
+    # Full specificity: country + region + city
+    if proxy_config.get("city"):
+        fallbacks.append((
+            f"{proxy_config['country']}/{proxy_config.get('region', '')}/{proxy_config['city']}",
+            build_proxy(proxy_config, session_id=username),
+        ))
+
+    # Region only (drop city)
+    if proxy_config.get("region"):
+        region_config = {k: v for k, v in proxy_config.items() if k != "city"}
+        fallbacks.append((
+            f"{proxy_config['country']}/{proxy_config['region']}",
+            build_proxy(region_config, session_id=username),
+        ))
+
+    # Country only (drop region and city)
+    country_config = {"country": proxy_config["country"]}
+    fallbacks.append((
+        f"{proxy_config['country']} only",
+        build_proxy(country_config, session_id=username),
+    ))
+
+    return fallbacks
+
+
 # ── main orchestration ────────────────────────────────────────────────
 
 
@@ -312,9 +351,25 @@ def run(dry_run: bool = False):
             # Load fingerprint and proxy config
             fingerprint = load_fingerprint(username, PROFILES_DIR)
             proxy_config = json.loads(account["connection_config"]) if account["connection_config"] else {}
-            proxy = build_proxy(proxy_config, session_id=username) if proxy_config else None
 
-            with create_browser(fingerprint, account["profile_dir"], proxy=proxy) as browser:
+            # Try proxy with full geo specificity, fall back to less specific on failure
+            browser = None
+            proxy_attempts = _build_proxy_fallbacks(proxy_config, username)
+            for attempt_label, proxy in proxy_attempts:
+                try:
+                    browser = create_browser(fingerprint, account["profile_dir"], proxy=proxy)
+                    log.info("Proxy connected: %s", attempt_label)
+                    break
+                except Exception as proxy_exc:
+                    if "InvalidProxy" in type(proxy_exc).__name__ or "Proxy" in str(proxy_exc):
+                        log.warning("Proxy failed (%s): %s — trying next fallback", attempt_label, proxy_exc)
+                        continue
+                    raise  # Non-proxy error, don't retry
+
+            if browser is None:
+                raise RuntimeError(f"All proxy fallbacks failed for {username}")
+
+            with browser:
                 page = browser.new_page()
 
                 # Login
