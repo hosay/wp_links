@@ -381,24 +381,22 @@ def find_live_replacement(url: str, page_title: str | None = None) -> dict | Non
                     "search_query": query,
                 }
 
-    # Strategy 3: Google title/URL search (fallback)
+    # Strategy 3: Title search — only if Wayback had content (so we have reference
+    # text to compare against). Blind title searches without reference text waste
+    # Tavily credits with near-zero hit rate.
+    if not wayback_text:
+        return None
+
     search_terms = []
-    if page_title:
-        search_terms.append(page_title)
     if wayback and wayback.get("title"):
         title = wayback["title"]
-        # Remove common Wayback Machine title artifacts
         title = re.sub(r'Wayback Machine', '', title).strip()
-        if title and title not in search_terms:
+        if title:
             search_terms.append(title)
-    if not search_terms:
-        # Use domain + path as search
-        parsed = urlparse(url)
-        path_words = parsed.path.replace("/", " ").replace("-", " ").replace("_", " ").strip()
-        if path_words:
-            search_terms.append(f"{parsed.netloc} {path_words}")
+    if page_title and page_title not in search_terms:
+        search_terms.append(page_title)
 
-    for term in search_terms[:2]:
+    for term in search_terms[:1]:  # Max 1 title search to conserve credits
         results = google_search(term, num_results=10)
         results = [
             r for r in results
@@ -406,8 +404,7 @@ def find_live_replacement(url: str, page_title: str | None = None) -> dict | Non
             and original_domain not in r["link"]
         ]
 
-        reference_text = wayback_text if wayback_text else term
-        best = _score_candidates(results, reference_text, url)
+        best = _score_candidates(results, wayback_text, url)
         if best:
             return {
                 "replacement_url": best["url"],

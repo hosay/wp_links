@@ -1,7 +1,7 @@
 """Wikipedia account creator via Camoufox + residential proxies.
 
 Creates accounts one at a time with unique fingerprints and residential
-proxy IPs (Bright Data). Uses claude -p to solve CAPTCHAs.
+proxy IPs (Rayobyte). Uses claude -p to solve CAPTCHAs.
 
 Usage:
     python -m dev.account_creator --create-all      # create all accounts from accounts.json
@@ -20,6 +20,7 @@ import requests as http_requests
 from dotenv import load_dotenv
 from camoufox.sync_api import Camoufox
 
+from dev.db import init_db, update_account_state
 from dev.fingerprint import generate_fingerprint
 
 load_dotenv()
@@ -29,43 +30,35 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 BASE_URL = "https://es.wikipedia.org"
 SCREENSHOTS_DIR = "dev/data/account_screenshots"
 ACCOUNTS_FILE = os.path.join(os.path.dirname(__file__), "data", "accounts.json")
-VPN_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "wireguard_confs")
 WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 
-# Bright Data residential proxy
-BRD_PROXY_HOST = os.environ.get("BRD_PROXY_HOST", "brd.superproxy.io")
-BRD_PROXY_PORT = os.environ.get("BRD_PROXY_PORT", "33335")
-BRD_PROXY_USER = os.environ.get("BRD_PROXY_USER", "")
-BRD_PROXY_PASS = os.environ.get("BRD_PROXY_PASS", "")
-
-# Country codes matching VPN config naming
-COUNTRY_MAP = {
-    "Chile": "cl", "Colombia": "co", "Mexico": "mx", "Spain": "es",
-}
+# Rayobyte residential proxy — geo params appended to password
+PROXY_HOST = os.environ.get("RAYOBYTE_PROXY_HOST", "la.residential.rayobyte.com")
+PROXY_PORT = os.environ.get("RAYOBYTE_PROXY_PORT", "8000")
+PROXY_USER = os.environ.get("RAYOBYTE_PROXY_USER", "")
+PROXY_PASS = os.environ.get("RAYOBYTE_PROXY_PASS", "")
 
 
-def _build_proxy(country_code: str = "es", session_id: str = "") -> dict:
-    """Build a Bright Data proxy dict for Camoufox.
+def build_proxy(proxy_config: dict, session_id: str = "") -> dict:
+    """Build a Rayobyte proxy dict for Camoufox.
 
-    Each session_id gets a sticky IP for the session duration.
+    Geo params (country, region, city) are appended to the password.
+    An optional session_id pins to a sticky residential IP.
+
+    proxy_config keys: country (required), region (optional), city (optional)
     """
-    user = f"{BRD_PROXY_USER}-country-{country_code}"
+    password = f"{PROXY_PASS}-country-{proxy_config['country']}"
+    if proxy_config.get("region"):
+        password += f"-region-{proxy_config['region']}"
+    if proxy_config.get("city"):
+        password += f"-city-{proxy_config['city']}"
     if session_id:
-        user += f"-session-{session_id}"
+        password += f"-session-{session_id}"
     return {
-        "server": f"http://{BRD_PROXY_HOST}:{BRD_PROXY_PORT}",
-        "username": user,
-        "password": BRD_PROXY_PASS,
+        "server": f"http://{PROXY_HOST}:{PROXY_PORT}",
+        "username": PROXY_USER,
+        "password": password,
     }
-
-
-def _country_from_vpn(vpn_conf: str) -> str:
-    """Extract country code from VPN config filename."""
-    basename = os.path.basename(vpn_conf)
-    for name, code in COUNTRY_MAP.items():
-        if basename.startswith(name):
-            return code
-    return "es"  # default to Spain
 
 
 def _human_delay(min_s: float = 2.0, max_s: float = 5.0):
@@ -123,23 +116,54 @@ def _extract_captcha_image(page) -> str | None:
     return None
 
 
-def create_account(username: str, password: str, vpn_conf_path: str) -> bool:
-    """Create a Wikipedia account using residential proxy.
+def create_account(username: str, password: str, proxy_config: dict) -> bool:
+    """Create a Wikipedia account using the account's residential proxy.
 
-    Returns True if successful. Uses claude -p for CAPTCHA solving.
+    Returns True if successful. Uses Gemini Vision for CAPTCHA solving.
+    The session_id is based on username for a consistent sticky IP across retries.
+    Tries proxy with decreasing geo specificity if connection fails.
     """
     fp = generate_fingerprint(username)
-    country = _country_from_vpn(vpn_conf_path)
-    session_id = f"{username}_{random.randint(10000, 99999)}"
-    proxy = _build_proxy(country, session_id)
-    log.info("Creating account: %s (country: %s, session: %s)", username, country, session_id)
+    log.info("Creating account: %s (proxy: %s)", username, proxy_config)
+
+    # Build proxy fallbacks: city → region → country
+    proxy_attempts = []
+    if proxy_config.get("city"):
+        proxy_attempts.append(("full", build_proxy(proxy_config, session_id=username)))
+    if proxy_config.get("region"):
+        region_only = {k: v for k, v in proxy_config.items() if k != "city"}
+        proxy_attempts.append(("region", build_proxy(region_only, session_id=username)))
+    country_only = {"country": proxy_config["country"]}
+    proxy_attempts.append(("country", build_proxy(country_only, session_id=username)))
+
+    proxy = None
+    for label, candidate_proxy in proxy_attempts:
+        try:
+            test_url = f"http://{candidate_proxy['username']}:{candidate_proxy['password']}@{PROXY_HOST}:{PROXY_PORT}"
+            http_requests.get("http://httpbin.org/ip",
+                              proxies={"http": test_url, "https": test_url}, timeout=8)
+            proxy = candidate_proxy
+            log.info("Proxy validated for account creation (%s): %s", label, proxy_config.get("country"))
+            break
+        except Exception:
+            log.warning("Proxy failed for account creation (%s) — trying next", label)
+            continue
+
+    if proxy is None:
+        log.error("All proxy fallbacks failed for account creation: %s", username)
+        return False
 
     try:
         prefs = dict(fp.get("firefox_user_prefs", {}))
         prefs["security.cert_pinning.enforcement_level"] = 0
 
-        with Camoufox(headless=True, os=fp.get("os"), firefox_user_prefs=prefs) as browser:
-            ctx = browser.new_context(proxy=proxy, ignore_https_errors=True)
+        with Camoufox(
+            headless=True,
+            os=fp.get("os"),
+            firefox_user_prefs=prefs,
+            proxy=proxy,
+        ) as browser:
+            ctx = browser.new_context(ignore_https_errors=True)
             page = ctx.new_page()
 
             reg_url = f"{BASE_URL}/w/index.php?title=Especial:Crear_una_cuenta&returnto=Portada"
@@ -149,8 +173,8 @@ def create_account(username: str, password: str, vpn_conf_path: str) -> bool:
             # Check if IP is blocked before filling the form
             pre_content = page.content().lower()
             if "bloqueado" in pre_content or "blocked" in pre_content:
-                log.error("IP is BLOCKED on Wikipedia — VPN %s unusable for account creation",
-                         os.path.basename(vpn_conf_path))
+                log.error("IP is BLOCKED on Wikipedia — proxy %s unusable for account creation",
+                         proxy_config)
                 _screenshot(page, f"create_{username}_BLOCKED")
                 return False
 
@@ -208,6 +232,15 @@ def create_account(username: str, password: str, vpn_conf_path: str) -> bool:
             if "bienvenido" in content or "bienveni" in content:
                 log.info("Account %s created successfully!", username)
                 _send_slack_image("", f":white_check_mark: Wikipedia account `{username}` created successfully!")
+                # Activate account in DB so orchestrator can pick it up
+                try:
+                    db_path = os.path.join(os.path.dirname(__file__), "wp_links.db")
+                    conn = init_db(db_path)
+                    update_account_state(conn, username, "warmup")
+                    conn.close()
+                    log.info("Account %s state set to warmup in DB", username)
+                except Exception as db_err:
+                    log.warning("Could not update DB state for %s: %s", username, db_err)
                 return True
 
             if "ya está registrado" in content or "already in use" in content:
@@ -219,8 +252,8 @@ def create_account(username: str, password: str, vpn_conf_path: str) -> bool:
                 return False
 
             if "bloqueado" in content or "blocked" in content:
-                log.error("IP is BLOCKED on Wikipedia for %s — try a different VPN", username)
-                _send_slack_image("", f":no_entry: IP blocked for `{username}` on VPN `{os.path.basename(vpn_conf_path)}`")
+                log.error("IP is BLOCKED on Wikipedia for %s — proxy %s", username, proxy_config)
+                _send_slack_image("", f":no_entry: IP blocked for `{username}` on proxy `{proxy_config}`")
                 return False
 
             # Check for error messages
@@ -239,8 +272,13 @@ def create_account(username: str, password: str, vpn_conf_path: str) -> bool:
 
 
 def _attempt_read_captcha(page) -> str | None:
-    """Use claude -p with vision to read the CAPTCHA image."""
-    import subprocess
+    """Use Gemini Vision API to read the CAPTCHA image."""
+    import base64
+
+    GEMINI_KEY = os.environ.get("GOOGLE_GEMENI_CONTENT_CREATOR", "")
+    if not GEMINI_KEY:
+        log.warning("Gemini API key not configured — cannot solve CAPTCHA")
+        return None
 
     # Save CAPTCHA image
     captcha_img = page.query_selector(".fancycaptcha-image img, .mw-createacct-captcha-area img")
@@ -257,33 +295,36 @@ def _attempt_read_captcha(page) -> str | None:
     captcha_img.screenshot(path=captcha_path)
     log.info("CAPTCHA image saved: %s", captcha_path)
 
-    # Use claude -p to read it
-    prompt = (
-        f"Read the file at {captcha_path}. "
-        "This is a CAPTCHA image with distorted text. "
-        "Output ONLY the text shown in the image, nothing else. "
-        "No explanation, no quotes, just the exact characters."
-    )
+    # Read image as base64
+    with open(captcha_path, "rb") as f:
+        image_b64 = base64.b64encode(f.read()).decode()
 
+    # Call Gemini Vision API
     try:
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--allowed-tools", "Read,Bash",
-             "--dangerously-skip-permissions"],
-            capture_output=True, text=True, timeout=60,
-            cwd="/opt/projects/wp_links",
+        resp = http_requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}",
+            json={
+                "contents": [{
+                    "parts": [
+                        {"text": "This is a CAPTCHA image with distorted text. Output ONLY the exact text/characters shown in the image. No explanation, no quotes, just the characters."},
+                        {"inline_data": {"mime_type": "image/png", "data": image_b64}},
+                    ]
+                }]
+            },
+            timeout=15,
+            headers={"Content-Type": "application/json"},
         )
-        answer = result.stdout.strip()
-        # Clean up — remove any extra text, just keep the CAPTCHA
-        # Take the last line if multi-line (Claude might add explanation)
+        resp.raise_for_status()
+        data = resp.json()
+        answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Clean up — take last line, strip quotes
         lines = [l.strip() for l in answer.split("\n") if l.strip()]
         if lines:
             captcha_text = lines[-1].strip("'\"` ")
-            log.info("Claude read CAPTCHA as: %s", captcha_text)
+            log.info("Gemini read CAPTCHA as: %s", captcha_text)
             return captcha_text
-    except subprocess.TimeoutExpired:
-        log.warning("Claude CAPTCHA read timed out")
     except Exception as e:
-        log.warning("Claude CAPTCHA read failed: %s", e)
+        log.warning("Gemini CAPTCHA read failed: %s", e)
 
     return None
 
@@ -300,15 +341,10 @@ def create_all_accounts():
     for i, acct in enumerate(accounts):
         username = acct["username"]
         password = acct["password"]
-        vpn_conf = os.path.join(VPN_DIR, acct["vpn_conf"])
-
-        if not os.path.exists(vpn_conf):
-            log.error("VPN config not found: %s — skipping %s", vpn_conf, username)
-            failed += 1
-            continue
+        proxy_config = acct["proxy"]
 
         log.info("=== Account %d/%d: %s ===", i + 1, len(accounts), username)
-        success = create_account(username, password, vpn_conf)
+        success = create_account(username, password, proxy_config)
 
         if success:
             created += 1
@@ -331,7 +367,8 @@ def create_all_accounts():
 
 def explore_registration():
     """Screenshot the registration page via residential proxy."""
-    proxy = _build_proxy("es", f"explore_{random.randint(1000,9999)}")
+    proxy_config = {"country": "ES"}
+    proxy = build_proxy(proxy_config, session_id=f"explore_{random.randint(1000,9999)}")
     fp = generate_fingerprint("explore_reg")
     with Camoufox(
         headless=True,
@@ -379,5 +416,4 @@ if __name__ == "__main__":
         if not acct:
             print(f"Account {target} not found in accounts.json")
             sys.exit(1)
-        vpn_path = os.path.join(VPN_DIR, acct["vpn_conf"])
-        create_account(target, acct["password"], vpn_path)
+        create_account(target, acct["password"], acct["proxy"])
