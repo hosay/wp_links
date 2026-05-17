@@ -47,4 +47,8 @@ with Camoufox(headless=True) as browser:
 
 **`wait_until` strategy:** use `"networkidle"` for React-rendered login pages, `"load"` for all other pages (analytics scripts block `networkidle`), and `"domcontentloaded"` for simple pages needing no interaction.
 
-**Residential proxies with geoip:** Use `geoip=True` with Camoufox to auto-spoof geolocation, timezone, locale, and WebRTC IP based on the proxy's location. Bright Data residential proxy creds are in `.env`.
+**Residential proxies with geoip:** Use `geoip=True` with Camoufox to auto-spoof geolocation, timezone, locale, and WebRTC IP based on the proxy's location. Rayobyte residential proxy creds are in `.env`.
+
+## Testing before committing
+
+Always verify that changes actually work end-to-end before committing. Do not assume external services (APIs, CAPTCHA solvers, proxies) will behave as expected — test them with real calls first. Set up a cron run, monitor the output, and only commit once the pipeline succeeds. Untested assumptions are bugs.

@@ -170,9 +170,13 @@ def create_account(username: str, password: str, proxy_config: dict) -> bool:
             page.goto(reg_url, wait_until="networkidle")
             _human_delay()
 
-            # Check if IP is blocked before filling the form
-            pre_content = page.content().lower()
-            if "bloqueado" in pre_content or "blocked" in pre_content:
+            # Check if IP is blocked — look for specific block notice elements,
+            # not just the word "bloqueado" which appears in unrelated page text
+            block_notice = page.query_selector(
+                "#mw-blocked-text, .mw-blockedtext, .mw-warning-with-logexcerpt, "
+                ".mw-abusefilter-warning"
+            )
+            if block_notice:
                 log.error("IP is BLOCKED on Wikipedia — proxy %s unusable for account creation",
                          proxy_config)
                 _screenshot(page, f"create_{username}_BLOCKED")
@@ -302,7 +306,7 @@ def _attempt_read_captcha(page) -> str | None:
     # Call Gemini Vision API
     try:
         resp = http_requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={GEMINI_KEY}",
             json={
                 "contents": [{
                     "parts": [

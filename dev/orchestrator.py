@@ -376,24 +376,40 @@ def run(dry_run: bool = False):
             if working_proxy is None and proxy_config:
                 raise RuntimeError(f"All proxy fallbacks failed for {username}")
 
+            # Create account on Wikipedia if not yet registered
+            # Must happen BEFORE opening the edit browser (can't nest Playwright)
+            is_registered = account["registered"] if "registered" in account.keys() else 0
+            if not is_registered:
+                log.info("Account %s not yet registered — creating on Wikipedia...", username)
+                from dev.account_creator import create_account
+                created = create_account(username, account["password"], proxy_config)
+                if created:
+                    log.info("Account %s registered successfully — skipping edit this run (first login next run)", username)
+                    conn.execute(
+                        "UPDATE accounts SET registered = 1 WHERE username = ?",
+                        (username,),
+                    )
+                    conn.commit()
+                    edit_records.append({
+                        "account": username, "time": datetime.now(timezone.utc).strftime("%H:%M"),
+                        "edit_type": "registration", "title": "N/A",
+                        "status": "success", "revision_id": None,
+                        "error_message": "",
+                    })
+                    accounts_used.append(username)
+                    continue  # First login on next run — avoids CAPTCHA accumulation
+                else:
+                    log.warning("Account creation failed for %s — skipping to next account", username)
+                    edit_records.append({
+                        "account": username, "time": datetime.now(timezone.utc).strftime("%H:%M"),
+                        "edit_type": "registration", "title": "N/A",
+                        "status": "failed", "revision_id": None,
+                        "error_message": "Wikipedia account creation failed",
+                    })
+                    continue
+
             with create_browser(fingerprint, account["profile_dir"], proxy=working_proxy) as browser:
                 page = browser.new_page()
-
-                # Check if account needs to be created on Wikipedia first
-                is_registered = account["registered"] if "registered" in account.keys() else 0
-                if not is_registered:
-                    log.info("Account %s not yet registered — creating on Wikipedia...", username)
-                    from dev.account_creator import create_account
-                    created = create_account(username, account["password"], proxy_config)
-                    if created:
-                        log.info("Account %s registered successfully", username)
-                        conn.execute(
-                            "UPDATE accounts SET registered = 1 WHERE username = ?",
-                            (username,),
-                        )
-                        conn.commit()
-                    else:
-                        raise RuntimeError(f"Account creation failed for {username}")
 
                 # Login
                 if not login(page, username, account["password"]):
