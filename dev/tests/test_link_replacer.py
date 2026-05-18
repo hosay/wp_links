@@ -191,11 +191,17 @@ def test_find_live_replacement_via_redirect():
 
 def test_find_live_replacement_no_redirect_tries_wayback_then_google():
     """Full pipeline: redirect fails → wayback content → phrase search."""
-    # Mock redirect check (no redirect)
+    # Mock redirect check (no redirect — HEAD returns 404, GET fallback also 404)
     head_resp = MagicMock()
     head_resp.status_code = 404
     head_resp.url = "http://dead.com/page"
     head_resp.history = []
+
+    # GET fallback for redirect check — also dead (no redirect)
+    redirect_get_resp = MagicMock()
+    redirect_get_resp.status_code = 404
+    redirect_get_resp.url = "http://dead.com/page"
+    redirect_get_resp.history = []
 
     # Mock Wayback availability
     wayback_avail = MagicMock()
@@ -243,7 +249,7 @@ def test_find_live_replacement_no_redirect_tries_wayback_then_google():
         with patch("dev.link_replacer.TavilyClient", return_value=mock_tavily):
             with patch("dev.link_replacer.requests.head", return_value=head_resp):
                 with patch("dev.link_replacer.requests.get",
-                           side_effect=[wayback_avail, wayback_page, candidate_resp]):
+                           side_effect=[redirect_get_resp, wayback_avail, wayback_page, candidate_resp]):
                     result = find_live_replacement("http://dead.com/page")
 
     assert result is not None
@@ -259,6 +265,12 @@ def test_find_live_replacement_returns_none_when_all_fail():
     head_resp.url = "http://gone.com/x"
     head_resp.history = []
 
+    # GET fallback for redirect + wayback check — both return no results
+    redirect_get_resp = MagicMock()
+    redirect_get_resp.status_code = 404
+    redirect_get_resp.url = "http://gone.com/x"
+    redirect_get_resp.history = []
+
     wayback_resp = MagicMock()
     wayback_resp.status_code = 200
     wayback_resp.json.return_value = {"archived_snapshots": {}}
@@ -269,7 +281,8 @@ def test_find_live_replacement_returns_none_when_all_fail():
     with _patch_tavily_key():
         with patch("dev.link_replacer.TavilyClient", return_value=mock_tavily):
             with patch("dev.link_replacer.requests.head", return_value=head_resp):
-                with patch("dev.link_replacer.requests.get", return_value=wayback_resp):
+                with patch("dev.link_replacer.requests.get",
+                           side_effect=[redirect_get_resp, wayback_resp]):
                     result = find_live_replacement("http://gone.com/x", page_title="Some Article")
 
     assert result is None

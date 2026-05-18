@@ -13,7 +13,7 @@ Uses only `requests` (no Camoufox, no residential proxy) to save bandwidth.
 import logging
 import os
 import re
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse, quote_plus, ParseResult
 
 import requests
 from dotenv import load_dotenv
@@ -301,6 +301,80 @@ def score_with_gemini(
         return {"score": 0.0, "reasoning": f"API error: {exc}", "is_same_content": False}
 
 
+# ── Redirect validation ──────────────────────────────────────────────
+
+
+def _path_depth(parsed_url) -> int:
+    """Count meaningful path segments (ignore trailing slash)."""
+    path = parsed_url.path.strip("/")
+    if not path:
+        return 0
+    return len(path.split("/"))
+
+
+def _is_valid_redirect(original: "ParseResult", redirect: "ParseResult") -> bool:
+    """Check if a redirect preserves content specificity.
+
+    Rejects:
+    - Redirects to homepages (path is "/" when original had deep path)
+    - Redirects to 404 pages
+    - Redirects that lose most of the path specificity
+    - Redirects to generic category/channel pages
+    - Cross-domain redirects that lose content specificity
+    """
+    redirect_path = redirect.path.strip("/").lower()
+
+    # Reject if redirect URL contains "404"
+    if "404" in redirect_path:
+        return False
+
+    orig_depth = _path_depth(original)
+    redir_depth = _path_depth(redirect)
+
+    # If original had a specific path (depth >= 2) but redirect is homepage
+    if orig_depth >= 2 and redir_depth == 0:
+        return False
+
+    # Check for generic landing page patterns
+    generic_patterns = ["/category/", "/categories/", "/kanalen/", "/tag/", "/tags/",
+                        "/channel/", "/channels/"]
+    if any(p in "/" + redirect_path + "/" for p in generic_patterns):
+        return False
+
+    # Cross-domain redirect: stricter validation needed
+    from dev.link_validator import is_same_org
+    orig_url = original.geturl()
+    redir_url = redirect.geturl()
+    same_org = is_same_org(orig_url, redir_url)
+
+    if not same_org:
+        # Different org: reject if redirect loses path specificity
+        # Exception: allow if query params carry content identity
+        if orig_depth >= 2 and redir_depth <= 1 and not redirect.query:
+            return False
+
+    # Same org: more permissive — URL rewrites that flatten paths are common
+    if same_org:
+        # Same org, path >= 1 → allow (e.g., /2010/08/25/article → /article)
+        if redir_depth >= 1:
+            return True
+        # Same org, landed on root with query params → allow
+        if redir_depth == 0 and redirect.query:
+            return True
+        # Same org, landed on bare root → reject
+        return redir_depth > 0
+
+    # Cross-org: allow if query params carry content identity
+    if redirect.query and orig_depth >= 3 and redir_depth <= 1:
+        return True
+
+    # Cross-org: reject if deep path lost and no query params
+    if orig_depth >= 3 and redir_depth <= 1 and not redirect.query:
+        return False
+
+    return True
+
+
 # ── Main pipeline ────────────────────────────────────────────────────
 
 
@@ -321,13 +395,21 @@ def find_live_replacement(url: str, page_title: str | None = None) -> dict | Non
     } or None.
     """
     original_domain = urlparse(url).netloc
+    original_parsed = urlparse(url)
 
     # Strategy 1: Redirect check (try HEAD then GET)
     try:
         head_resp = requests.head(url, allow_redirects=True, timeout=10, headers=_HEADERS)
-        if head_resp.history and head_resp.status_code == 200:
-            final_url = str(head_resp.url)
-            if final_url != url:
+        final_url = str(head_resp.url) if head_resp.history else None
+
+        # Some servers block HEAD — try GET if HEAD returned 4xx/5xx but had redirects
+        if not final_url or head_resp.status_code >= 400:
+            get_resp = requests.get(url, allow_redirects=True, timeout=10, headers=_HEADERS)
+            if get_resp.history and get_resp.status_code == 200:
+                final_url = str(get_resp.url)
+
+        if final_url and final_url != url:
+            if _is_valid_redirect(original_parsed, urlparse(final_url)):
                 return {
                     "replacement_url": final_url,
                     "source": "redirect",
@@ -335,19 +417,8 @@ def find_live_replacement(url: str, page_title: str | None = None) -> dict | Non
                     "wayback_snapshot_url": None,
                     "search_query": None,
                 }
-        # Some servers block HEAD — try GET if HEAD returned 4xx/5xx but had redirects
-        if head_resp.history and head_resp.status_code >= 400:
-            get_resp = requests.get(url, allow_redirects=True, timeout=10, headers=_HEADERS)
-            if get_resp.history and get_resp.status_code == 200:
-                final_url = str(get_resp.url)
-                if final_url != url:
-                    return {
-                        "replacement_url": final_url,
-                        "source": "redirect",
-                        "similarity_score": 1.0,
-                        "wayback_snapshot_url": None,
-                        "search_query": None,
-                    }
+            else:
+                log.info("Redirect rejected (generic/homepage): %s → %s", url[:60], final_url[:60])
     except Exception:
         pass  # URL is dead, proceed to next strategy
 
