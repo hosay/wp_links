@@ -137,3 +137,13 @@ def test_blocked_account_retried_after_blocked_until_expires(db):
     selected = select_daily_accounts(db, count=5)
     usernames = [a["username"] for a in selected]
     assert "editor0" in usernames
+
+
+def test_verify_password_returns_false_on_exception():
+    """_verify_password must return False on exception, not True."""
+    from dev.account_creator import _verify_password
+
+    with patch("dev.account_creator.http_requests.Session") as mock_session:
+        mock_session.return_value.get.side_effect = ConnectionError("proxy down")
+        result = _verify_password("testuser", "testpass", {"server": "x", "username": "u", "password": "p"})
+        assert result is False

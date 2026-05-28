@@ -132,8 +132,65 @@ def _verify_password(username: str, password: str, proxy_dict: dict | None = Non
         log.warning("Password verification failed for %s: %s", username, result)
         return False
     except Exception as exc:
-        log.warning("Could not verify password for %s: %s — assuming OK", username, exc)
-        return True  # Don't block on API failure
+        log.warning("Could not verify password for %s: %s", username, exc)
+        return False
+
+
+def _verify_password_browser(username: str, password: str, proxy_dict: dict) -> bool:
+    """Verify a Wikipedia account login using Camoufox browser.
+
+    Uses the same login flow as the orchestrator to catch passwords that
+    pass API verification but fail browser login (e.g. due to proxy
+    session residue from createaccount).
+    """
+    try:
+        with Camoufox(headless=True, proxy=proxy_dict, geoip=True) as browser:
+            page = browser.new_page()
+            page.goto(
+                f"{BASE_URL}/w/index.php?title=Especial:Entrar&returnto=Portada",
+                wait_until="domcontentloaded", timeout=30000,
+            )
+            time.sleep(random.uniform(1.0, 2.0))
+
+            page.click("#wpName1")
+            time.sleep(0.3)
+            page.type("#wpName1", username, delay=80)
+            time.sleep(random.uniform(0.5, 1.0))
+            page.click("#wpPassword1")
+            time.sleep(0.3)
+            page.type("#wpPassword1", password, delay=80)
+            time.sleep(random.uniform(0.5, 1.0))
+
+            page.click("#wpLoginAttempt")
+            try:
+                page.wait_for_url(f"{BASE_URL}/**", timeout=20000)
+            except Exception:
+                pass
+            try:
+                page.wait_for_load_state("load", timeout=10000)
+            except Exception:
+                pass
+            time.sleep(1)
+
+            current_url = page.url
+            if "Entrar" in current_url or "UserLogin" in current_url:
+                log.warning("Browser login verification failed for %s (still on login page)", username)
+                return False
+
+            logged_in = page.query_selector(
+                f'a[href*="Usuario:{username}"], a[href*="User:{username}"], '
+                f"#pt-userpage-2, #pt-userpage"
+            ) is not None
+
+            if logged_in:
+                log.info("Browser login verified for %s", username)
+                return True
+
+            log.warning("Browser login uncertain for %s (url=%s)", username, current_url[:80])
+            return False
+    except Exception as exc:
+        log.warning("Browser verification error for %s: %s", username, exc)
+        return False
 
 
 def _human_delay(min_s: float = 2.0, max_s: float = 5.0):
@@ -538,20 +595,20 @@ def create_account(username: str, password: str, proxy_config: dict, conn=None) 
         log.info("Registration result for %s on %s: %s", username, label, result)
 
         if result == "success":
-            # Wait for account to propagate from auth.wikimedia.org to es.wikipedia.org
-            time.sleep(10)
-            if not _verify_password(username, password, proxy_dict):
-                log.warning("Password check failed for %s — waiting longer and retrying...", username)
-                time.sleep(15)
-                if not _verify_password(username, password, proxy_dict):
-                    log.warning("Proxy verify failed — retrying without proxy...")
-                    time.sleep(10)
-                    if not _verify_password(username, password):
-                        log.error("Account %s created but password FAILED verification", username)
-                        _send_slack_image("", f":warning: Account `{username}` created but password mismatch")
-                        return False
+            # Wait for account to propagate across Wikimedia CentralAuth
+            time.sleep(15)
 
-            _send_slack_image("", f":white_check_mark: Account `{username}` created and password verified!")
+            # Verify password with a BROWSER login (same method the orchestrator uses)
+            # to catch false positives from API-only verification
+            if not _verify_password_browser(username, password, proxy_dict):
+                log.warning("Browser login failed for %s — waiting and retrying...", username)
+                time.sleep(20)
+                if not _verify_password_browser(username, password, proxy_dict):
+                    log.error("Account %s created but browser login FAILED", username)
+                    _send_slack_image("", f":warning: Account `{username}` created but login failed")
+                    return False
+
+            _send_slack_image("", f":white_check_mark: Account `{username}` created and login verified!")
             if conn:
                 update_account_state(conn, username, "warmup")
                 from dev.db import reassign_proxy
