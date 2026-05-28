@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import random
+import subprocess
 import sys
 import time
 
@@ -39,6 +40,33 @@ PROXY_USER = os.environ.get("RAYOBYTE_PROXY_USER", "")
 PROXY_PASS = os.environ.get("RAYOBYTE_PROXY_PASS", "")
 
 
+FALLBACK_PROXIES = [
+    {"country": "MX", "region": "mexico_city"},
+    {"country": "ES", "region": "madrid"},
+]
+
+
+def get_backoff_hours(block_count: int) -> int:
+    """Escalating backoff: 24h, 36h, 48h (capped)."""
+    return min(24 + 12 * block_count, 48)
+
+
+def get_fallback_proxy(current_proxy: dict) -> dict | None:
+    """Return next fallback proxy, or None if exhausted.
+
+    Chain: original → MX/mexico_city → ES/madrid → None.
+    If current proxy is already in the fallback chain, return the next one.
+    """
+    # Check if current proxy matches any fallback
+    for i, fallback in enumerate(FALLBACK_PROXIES):
+        if (current_proxy.get("country") == fallback["country"]
+                and current_proxy.get("region") == fallback["region"]):
+            # Already on this fallback — return next in chain, or None
+            return FALLBACK_PROXIES[i + 1] if i + 1 < len(FALLBACK_PROXIES) else None
+    # Not in fallback chain yet — return first fallback
+    return FALLBACK_PROXIES[0]
+
+
 def build_proxy(proxy_config: dict, session_id: str = "") -> dict:
     """Build a Rayobyte proxy dict for Camoufox.
 
@@ -59,6 +87,53 @@ def build_proxy(proxy_config: dict, session_id: str = "") -> dict:
         "username": PROXY_USER,
         "password": password,
     }
+
+
+def _verify_password(username: str, password: str, proxy_dict: dict | None = None) -> bool:
+    """Verify a Wikipedia account's password works via the API.
+
+    Called immediately after registration to catch passwords that were
+    mistyped during the form fill. Uses the same proxy as registration
+    to avoid propagation/routing issues.
+    """
+    try:
+        session = http_requests.Session()
+        session.headers = {"User-Agent": "Mozilla/5.0"}
+        if proxy_dict:
+            proxy_url = (
+                f"http://{proxy_dict['username']}:{proxy_dict['password']}"
+                f"@{proxy_dict['server'].replace('http://', '')}"
+            )
+            session.proxies = {"https": proxy_url, "http": proxy_url}
+
+        r1 = session.get(
+            "https://es.wikipedia.org/w/api.php",
+            params={"action": "query", "meta": "tokens", "type": "login", "format": "json"},
+            timeout=15,
+        )
+        token = r1.json()["query"]["tokens"]["logintoken"]
+
+        r2 = session.post(
+            "https://es.wikipedia.org/w/api.php",
+            data={
+                "action": "clientlogin",
+                "username": username,
+                "password": password,
+                "logintoken": token,
+                "loginreturnurl": "https://es.wikipedia.org/",
+                "format": "json",
+            },
+            timeout=15,
+        )
+        result = r2.json().get("clientlogin", {}).get("status", "")
+        if result == "PASS":
+            log.info("Password verified for %s", username)
+            return True
+        log.warning("Password verification failed for %s: %s", username, result)
+        return False
+    except Exception as exc:
+        log.warning("Could not verify password for %s: %s — assuming OK", username, exc)
+        return True  # Don't block on API failure
 
 
 def _human_delay(min_s: float = 2.0, max_s: float = 5.0):
@@ -116,42 +191,131 @@ def _extract_captcha_image(page) -> str | None:
     return None
 
 
-def create_account(username: str, password: str, proxy_config: dict) -> bool:
-    """Create a Wikipedia account using the account's residential proxy.
+def _handle_ip_block(username: str, proxy_config: dict, conn=None):
+    """Handle an IP block: update DB state, escalate proxy if needed."""
+    _send_slack_image("", f":no_entry: IP blocked for `{username}` on proxy `{proxy_config}`")
+    if conn is None:
+        return
+    from dev.db import mark_account_blocked, get_block_count, reassign_proxy
+    block_count = get_block_count(conn, username)
+    hours = get_backoff_hours(block_count)
+    mark_account_blocked(conn, username, hours=hours)
+    log.info("Account %s blocked for %dh (block #%d)", username, hours, block_count + 1)
+    # After 3 blocks on same proxy, reassign to fallback geo
+    if block_count + 1 >= 3:
+        fallback = get_fallback_proxy(proxy_config)
+        if fallback:
+            reassign_proxy(conn, username, fallback)
+            log.info("Reassigned %s proxy to %s after %d blocks", username, fallback, block_count + 1)
+            _send_slack_image("", f":arrows_counterclockwise: Reassigned `{username}` proxy to `{fallback}`")
 
-    Returns True if successful. Uses Gemini Vision for CAPTCHA solving.
-    The session_id is based on username for a consistent sticky IP across retries.
-    Tries proxy with decreasing geo specificity if connection fails.
+
+def _attempt_registration_api(username: str, password: str, proxy_dict: dict, proxy_label: str) -> str:
+    """Create a Wikipedia account via the MediaWiki API.
+
+    Bypasses the browser form entirely — avoids Playwright event loop issues
+    and password mismatch bugs in the browser-based flow.
+
+    Returns: 'success', 'ip_blocked', 'username_taken', 'captcha_fail', or 'error:<message>'.
     """
-    fp = generate_fingerprint(username)
-    log.info("Creating account: %s (proxy: %s)", username, proxy_config)
+    import base64
 
-    # Build proxy fallbacks: city → region → country
-    proxy_attempts = []
-    if proxy_config.get("city"):
-        proxy_attempts.append(("full", build_proxy(proxy_config, session_id=username)))
-    if proxy_config.get("region"):
-        region_only = {k: v for k, v in proxy_config.items() if k != "city"}
-        proxy_attempts.append(("region", build_proxy(region_only, session_id=username)))
-    country_only = {"country": proxy_config["country"]}
-    proxy_attempts.append(("country", build_proxy(country_only, session_id=username)))
+    GEMINI_KEY = os.environ.get("GOOGLE_GEMENI_CONTENT_CREATOR", "")
+    proxy_url = (
+        f"http://{proxy_dict['username']}:{proxy_dict['password']}"
+        f"@{proxy_dict['server'].replace('http://', '')}"
+    )
 
-    proxy = None
-    for label, candidate_proxy in proxy_attempts:
-        try:
-            test_url = f"http://{candidate_proxy['username']}:{candidate_proxy['password']}@{PROXY_HOST}:{PROXY_PORT}"
-            http_requests.get("http://httpbin.org/ip",
-                              proxies={"http": test_url, "https": test_url}, timeout=8)
-            proxy = candidate_proxy
-            log.info("Proxy validated for account creation (%s): %s", label, proxy_config.get("country"))
-            break
-        except Exception:
-            log.warning("Proxy failed for account creation (%s) — trying next", label)
-            continue
+    try:
+        session = http_requests.Session()
+        session.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Firefox/120.0"}
+        session.proxies = {"https": proxy_url, "http": proxy_url}
 
-    if proxy is None:
-        log.error("All proxy fallbacks failed for account creation: %s", username)
-        return False
+        # Get createaccount token
+        r1 = session.get(
+            f"{BASE_URL}/w/api.php",
+            params={"action": "query", "meta": "tokens", "type": "createaccount", "format": "json"},
+            timeout=20,
+        )
+        token = r1.json()["query"]["tokens"]["createaccounttoken"]
+
+        # Get CAPTCHA
+        cr = session.get(
+            f"{BASE_URL}/w/api.php",
+            params={"action": "fancycaptchareload", "format": "json"},
+            timeout=15,
+        )
+        captcha_index = cr.json()["fancycaptchareload"]["index"]
+
+        # Download CAPTCHA image
+        img = session.get(
+            f"{BASE_URL}/w/index.php?title=Especial:Captcha/image&wpCaptchaId={captcha_index}",
+            timeout=15,
+        )
+        img_b64 = base64.b64encode(img.content).decode()
+
+        # Solve with Gemini
+        if not GEMINI_KEY:
+            return "error:no_gemini_key"
+
+        gr = http_requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={GEMINI_KEY}",
+            json={"contents": [{"parts": [
+                {"text": "CAPTCHA image with distorted text. Output ONLY the characters. No explanation, no quotes."},
+                {"inline_data": {"mime_type": "image/png", "data": img_b64}},
+            ]}]},
+            timeout=15,
+        )
+        gr.raise_for_status()
+        captcha_answer = gr.json()["candidates"][0]["content"]["parts"][0]["text"].strip().strip("'\"` ")
+        log.info("CAPTCHA solved via API: %s", captcha_answer)
+
+        # Create account
+        r3 = session.post(
+            f"{BASE_URL}/w/api.php",
+            data={
+                "action": "createaccount",
+                "createtoken": token,
+                "username": username,
+                "password": password,
+                "retype": password,
+                "captchaId": captcha_index,
+                "captchaWord": captcha_answer,
+                "createreturnurl": f"{BASE_URL}/",
+                "format": "json",
+            },
+            timeout=20,
+        )
+        result = r3.json().get("createaccount", {})
+        status = result.get("status", "")
+
+        if status == "PASS":
+            return "success"
+
+        msg = result.get("messagecode", result.get("message", ""))
+        if "userexists" in msg or "already" in str(msg).lower():
+            return "username_taken"
+        if "blocked" in str(msg).lower() or "bloqueado" in str(msg).lower():
+            return "ip_blocked"
+        if "captcha" in str(msg).lower():
+            return "captcha_fail"
+
+        return f"error:{msg}"
+
+    except http_requests.exceptions.ProxyError:
+        return "error:proxy_connection_failed"
+    except Exception as e:
+        return f"error:{e}"
+
+
+def _attempt_registration(username: str, password: str, proxy_dict: dict, proxy_label: str, fp: dict) -> str:
+    """Attempt registration with one proxy, retrying CAPTCHAs within the same browser.
+
+    Returns: 'success', 'ip_blocked', 'username_taken', or 'error:<message>'.
+    Handles CAPTCHA retries internally (up to 3 attempts) within one
+    Camoufox session to avoid Playwright event loop corruption.
+    """
+    max_captcha_retries = 3
 
     try:
         prefs = dict(fp.get("firefox_user_prefs", {}))
@@ -161,118 +325,264 @@ def create_account(username: str, password: str, proxy_config: dict) -> bool:
             headless=True,
             os=fp.get("os"),
             firefox_user_prefs=prefs,
-            proxy=proxy,
+            proxy=proxy_dict,
+            geoip=True,
         ) as browser:
-            ctx = browser.new_context(ignore_https_errors=True)
-            page = ctx.new_page()
+            page = browser.new_page()
 
-            reg_url = f"{BASE_URL}/w/index.php?title=Especial:Crear_una_cuenta&returnto=Portada"
-            page.goto(reg_url, wait_until="networkidle")
-            _human_delay()
-
-            # Check if IP is blocked — look for specific block notice elements,
-            # not just the word "bloqueado" which appears in unrelated page text
-            block_notice = page.query_selector(
-                "#mw-blocked-text, .mw-blockedtext, .mw-warning-with-logexcerpt, "
-                ".mw-abusefilter-warning"
-            )
-            if block_notice:
-                log.error("IP is BLOCKED on Wikipedia — proxy %s unusable for account creation",
-                         proxy_config)
-                _screenshot(page, f"create_{username}_BLOCKED")
-                return False
-
-            # Fill form fields (auth.wikimedia.org uses placeholder-based fields)
-            _type_human(page, 'input[placeholder*="nombre de usuario"], input[name="wpName"]', username)
-            _human_delay(0.5, 1.5)
-            _type_human(page, 'input[placeholder*="contraseña"]:not([placeholder*="nuevo"]):not([placeholder*="Introduce"]), input[name="wpPassword"]', password)
-            _human_delay(0.5, 1.0)
-            _type_human(page, 'input[placeholder*="nuevo"], input[placeholder*="Introduce"], input[name="retype"]', password)
-            _human_delay(0.5, 1.0)
-
-            _screenshot(page, f"create_{username}_01_filled")
-
-            # Handle CAPTCHA
-            captcha_field = page.query_selector('input[name="captchaWord"], input[placeholder*="texto que ves"]')
-            if captcha_field:
-                log.info("CAPTCHA detected — extracting image...")
-                captcha_path = _extract_captcha_image(page)
-                if not captcha_path:
-                    # Fallback: screenshot the whole page
-                    captcha_path = _screenshot(page, f"create_{username}_02_captcha_full")
-
-                # Try to read the CAPTCHA myself from the image
-                captcha_text = _attempt_read_captcha(page)
-                if captcha_text:
-                    log.info("CAPTCHA read attempt: %s", captcha_text)
-                    _type_human(page, 'input[name="captchaWord"], input[placeholder*="texto que ves"]', captcha_text)
-                else:
-                    # Send to Slack for help
-                    _send_slack_image(
-                        captcha_path,
-                        f":key: *Wikipedia CAPTCHA* for account `{username}`\n"
-                        f"Please reply with the CAPTCHA text. Screenshot saved at: `{captcha_path}`"
-                    )
-                    log.warning("Sent CAPTCHA to Slack. Cannot solve automatically — skipping %s", username)
-                    return False
-
-            _human_delay(0.5, 1.0)
-            _screenshot(page, f"create_{username}_03_before_submit")
-
-            # Submit
-            submit = page.query_selector('button:has-text("Crea tu cuenta"), button:has-text("Crear tu cuenta"), button[name="wpCreateaccount"]')
-            if submit:
-                submit.click()
-            else:
-                log.warning("No submit button found — trying Enter key")
-                page.keyboard.press("Enter")
-
-            page.wait_for_load_state("networkidle")
-            _human_delay()
-            _screenshot(page, f"create_{username}_04_result")
-
-            # Check result
-            content = page.content().lower()
-            if "bienvenido" in content or "bienveni" in content:
-                log.info("Account %s created successfully!", username)
-                _send_slack_image("", f":white_check_mark: Wikipedia account `{username}` created successfully!")
-                # Activate account in DB so orchestrator can pick it up
+            for captcha_attempt in range(max_captcha_retries):
+                reg_url = f"{BASE_URL}/w/index.php?title=Especial:Crear_una_cuenta&returnto=Portada"
                 try:
-                    db_path = os.path.join(os.path.dirname(__file__), "wp_links.db")
-                    conn = init_db(db_path)
-                    update_account_state(conn, username, "warmup")
-                    conn.close()
-                    log.info("Account %s state set to warmup in DB", username)
-                except Exception as db_err:
-                    log.warning("Could not update DB state for %s: %s", username, db_err)
-                return True
+                    page.goto(reg_url, wait_until="domcontentloaded", timeout=60000)
+                except Exception:
+                    return "error:page_load_timeout"
+                _human_delay()
 
-            if "ya está registrado" in content or "already in use" in content:
-                log.warning("Username %s already taken", username)
-                return False
+                # Check if IP is blocked
+                block_notice = page.query_selector(
+                    "#mw-blocked-text, .mw-blockedtext, .mw-warning-with-logexcerpt, "
+                    ".mw-abusefilter-warning"
+                )
+                if block_notice:
+                    log.warning("IP blocked on proxy %s for %s", proxy_label, username)
+                    _screenshot(page, f"create_{username}_BLOCKED")
+                    return "ip_blocked"
 
-            if "captcha" in content and "incorrecto" in content:
-                log.warning("CAPTCHA was incorrect for %s", username)
-                return False
+                # Fill form — use exact field names for reliability
+                _type_human(page, 'input[name="wpName"]', username)
+                _human_delay(0.5, 1.5)
+                # Type passwords character-by-character with short delay
+                # (page.fill bypasses JS event handlers, causing password mismatch)
+                page.click('input[name="wpPassword"]')
+                _human_delay(0.3, 0.5)
+                page.type('input[name="wpPassword"]', password, delay=30)
+                _human_delay(0.5, 1.0)
+                page.click('input[name="retype"]')
+                _human_delay(0.3, 0.5)
+                page.type('input[name="retype"]', password, delay=30)
+                _human_delay(0.5, 1.0)
 
-            if "bloqueado" in content or "blocked" in content:
-                log.error("IP is BLOCKED on Wikipedia for %s — proxy %s", username, proxy_config)
-                _send_slack_image("", f":no_entry: IP blocked for `{username}` on proxy `{proxy_config}`")
-                return False
+                # Verify password was typed correctly
+                typed_pw = page.eval_on_selector('input[name="wpPassword"]', 'el => el.value')
+                typed_retype = page.eval_on_selector('input[name="retype"]', 'el => el.value')
+                if typed_pw != password or typed_retype != password:
+                    log.error("Password mismatch! pw=%s retype=%s expected=%s",
+                             repr(typed_pw), repr(typed_retype), repr(password))
+                    return "error:password_type_mismatch"
+                log.info("Password verified in form: matches expected value")
 
-            # Check for error messages
-            error_el = page.query_selector(".error, .errorbox, .cdx-message--error")
-            if error_el:
-                error_text = error_el.inner_text()
-                log.error("Registration error for %s: %s", username, error_text[:200])
-                return False
+                # Handle CAPTCHA
+                captcha_field = page.query_selector('input[name="captchaWord"], input[placeholder*="texto que ves"]')
+                if captcha_field:
+                    log.info("CAPTCHA detected (attempt %d/%d)...", captcha_attempt + 1, max_captcha_retries)
+                    captcha_path = _extract_captcha_image(page)
+                    if not captcha_path:
+                        captcha_path = _screenshot(page, f"create_{username}_captcha")
 
-            log.warning("Unclear result for %s — check screenshots", username)
-            return False
+                    captcha_text = _attempt_read_captcha(page)
+                    if captcha_text:
+                        log.info("CAPTCHA read: %s", captcha_text)
+                        _type_human(page, 'input[name="captchaWord"], input[placeholder*="texto que ves"]', captcha_text)
+                    else:
+                        return "error:captcha_unsolvable"
+
+                _human_delay(0.5, 1.0)
+
+                # Submit
+                submit = page.query_selector('button:has-text("Crea tu cuenta"), button:has-text("Crear tu cuenta"), button[name="wpCreateaccount"]')
+                if submit:
+                    submit.click()
+                else:
+                    page.keyboard.press("Enter")
+
+                try:
+                    page.wait_for_load_state("load", timeout=45000)
+                except Exception:
+                    pass
+                _human_delay()
+                _screenshot(page, f"create_{username}_result")
+
+                # Check result
+                content = page.content().lower()
+                if "bienvenido" in content or "bienveni" in content:
+                    return "success"
+                if "ya está registrado" in content or "already in use" in content:
+                    return "username_taken"
+                if "captcha" in content and "incorrecto" in content:
+                    log.warning("CAPTCHA incorrect for %s (attempt %d/%d)",
+                               username, captcha_attempt + 1, max_captcha_retries)
+                    _human_delay(1.0, 2.0)
+                    continue  # Retry within same browser session
+                if "bloqueado" in content or "blocked" in content:
+                    return "ip_blocked"
+
+                error_el = page.query_selector(".error, .errorbox, .cdx-message--error")
+                if error_el:
+                    return f"error:{error_el.inner_text()[:100]}"
+
+                return "error:unclear_result"
+
+            return "error:captcha_retries_exhausted"
 
     except Exception as e:
-        log.error("Account creation failed for %s: %s", username, e)
+        return f"error:{e}"
+
+
+def _test_registration_proxy(proxy_dict: dict, timeout: int = 15) -> bool:
+    """Test if a proxy can reach the Wikipedia registration page without IP block.
+
+    Fetches the registration page via HTTP and checks for block indicators.
+    This avoids creating a Camoufox instance for each proxy test (Playwright
+    can only be instantiated once per process).
+    """
+    proxy_url = (
+        f"http://{proxy_dict['username']}:{proxy_dict['password']}"
+        f"@{proxy_dict['server'].replace('http://', '')}"
+    )
+    try:
+        resp = http_requests.get(
+            f"{BASE_URL}/w/index.php?title=Especial:Crear_una_cuenta&returnto=Portada",
+            proxies={"https": proxy_url, "http": proxy_url},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            return False
+        content = resp.text.lower()
+        # Check for IP block indicators
+        if "mw-blocked-text" in content or "mw-blockedtext" in content:
+            return False
+        if "bloqueado" in content and ("crear" in content or "cuenta" in content):
+            return False
+        # Should have the registration form
+        return "wpname" in content or "nombre de usuario" in content
+    except Exception:
         return False
+
+
+
+def _run_registration_subprocess(username: str, password: str, proxy_config: dict) -> str:
+    """Run a single registration attempt in an isolated subprocess.
+
+    Returns the result string from _attempt_registration.
+    Subprocess isolation avoids Playwright event loop corruption when
+    retrying with different proxies.
+    """
+    import subprocess
+    import shlex
+
+    script = f"""
+import sys, json, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath("{os.path.abspath(__file__)}"))))
+os.chdir(os.path.dirname(os.path.dirname(os.path.abspath("{os.path.abspath(__file__)}"))))
+from dotenv import load_dotenv
+load_dotenv()
+from dev.account_creator import _attempt_registration, build_proxy
+from dev.fingerprint import generate_fingerprint
+proxy_config = {json.dumps(proxy_config)}
+proxy_dict = build_proxy(proxy_config, session_id="{username}")
+fp = generate_fingerprint("{username}")
+label = f"{{proxy_config.get('country','?')}}/{{proxy_config.get('region','')}}/{{proxy_config.get('city','')}}"
+result = _attempt_registration("{username}", "{password}", proxy_dict, label, fp)
+print("RESULT:" + result)
+"""
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=180,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        for line in proc.stdout.splitlines():
+            if line.startswith("RESULT:"):
+                return line[7:]
+        # Log stderr for debugging
+        if proc.stderr:
+            for line in proc.stderr.strip().splitlines()[-5:]:
+                log.warning("subprocess: %s", line)
+        return f"error:no_result_from_subprocess"
+    except subprocess.TimeoutExpired:
+        return "error:subprocess_timeout"
+    except Exception as e:
+        return f"error:subprocess_{e}"
+
+
+def create_account(username: str, password: str, proxy_config: dict, conn=None) -> bool:
+    """Create a Wikipedia account via API, rotating through proxies on IP blocks.
+
+    Pre-tests proxies via HTTP for registration page access, then uses
+    the MediaWiki API for actual account creation (avoids browser form
+    password mismatch issues). Tries multiple proxies until one succeeds.
+
+    conn: optional DB connection for block tracking.
+    """
+    from dev.data.proxy_pool import get_rotation_pool
+
+    pool = get_rotation_pool(proxy_config, max_attempts=15)
+
+    for i, candidate in enumerate(pool):
+        label = f"{candidate.get('country', '?')}/{candidate.get('region', '')}/{candidate.get('city', '')}"
+        proxy_dict = build_proxy(candidate, session_id=username)
+
+        # Quick HTTP pre-test
+        log.info("Registration proxy test %d/%d for %s: %s", i + 1, len(pool), username, label)
+        if not _test_registration_proxy(proxy_dict):
+            log.warning("Proxy %s blocked/unreachable (HTTP check) — trying next", label)
+            if i < len(pool) - 1:
+                time.sleep(2)
+            continue
+
+        log.info("Proxy %s passed HTTP check — attempting API registration", label)
+        proxy_dict = build_proxy(candidate, session_id=username)
+        result = _attempt_registration_api(username, password, proxy_dict, label)
+        log.info("Registration result for %s on %s: %s", username, label, result)
+
+        if result == "success":
+            # Wait for account to propagate from auth.wikimedia.org to es.wikipedia.org
+            time.sleep(10)
+            if not _verify_password(username, password, proxy_dict):
+                log.warning("Password check failed for %s — waiting longer and retrying...", username)
+                time.sleep(15)
+                if not _verify_password(username, password, proxy_dict):
+                    log.warning("Proxy verify failed — retrying without proxy...")
+                    time.sleep(10)
+                    if not _verify_password(username, password):
+                        log.error("Account %s created but password FAILED verification", username)
+                        _send_slack_image("", f":warning: Account `{username}` created but password mismatch")
+                        return False
+
+            _send_slack_image("", f":white_check_mark: Account `{username}` created and password verified!")
+            if conn:
+                update_account_state(conn, username, "warmup")
+                from dev.db import reassign_proxy
+                reassign_proxy(conn, username, candidate)
+                log.info("Saved registration proxy for %s: %s", username, candidate)
+            return True
+
+        if result == "username_taken":
+            log.warning("Username %s already taken on Wikipedia", username)
+            return False
+
+        if result == "ip_blocked":
+            log.warning("Proxy %s blocked at form submit for %s — trying next proxy", label, username)
+            if i < len(pool) - 1:
+                time.sleep(random.uniform(3, 8))
+            continue  # Try next proxy!
+
+        if "antispoof" in result:
+            log.warning("Username %s blocked by AntiSpoof — cannot register on any proxy", username)
+            if conn:
+                update_account_state(conn, username, "antispoof_blocked")
+            return False
+
+        # Other error — try next proxy
+        log.warning("Registration error for %s on %s: %s — trying next", username, label, result)
+        if i < len(pool) - 1:
+            time.sleep(random.uniform(3, 8))
+        continue
+
+    log.error("All %d proxies exhausted for registration of %s", len(pool), username)
+    return False
 
 
 def _attempt_read_captcha(page) -> str | None:

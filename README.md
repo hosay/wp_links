@@ -45,45 +45,50 @@ SEOPACK_URL=https://seopack.org
 SEOPACK_USERNAME=...
 SEOPACK_PASSWORD=...
 SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
-BRD_PROXY_HOST=brd.superproxy.io
-BRD_PROXY_PORT=33335
-BRD_PROXY_USER=brd-customer-...-zone-residential_proxy1
-BRD_PROXY_PASS=...
+RAYOBYTE_PROXY_HOST=la.residential.rayobyte.com
+RAYOBYTE_PROXY_PORT=8000
+RAYOBYTE_PROXY_USER=...
+RAYOBYTE_PROXY_PASS=...
 ```
 
 ## Account Creation
 
-Wikipedia blocks VPN/datacenter IPs for account creation. Use **Bright Data residential proxies** (requires KYC approval for POST requests to Wikipedia).
+Wikipedia blocks VPN/datacenter IPs for account creation. Use **Rayobyte residential proxies** for account creation.
 
 ```bash
-# Generate accounts.json with 20 accounts mapped to VPN configs
-python -m dev.setup_accounts --generate 20
+# Populate DB from accounts.json (generates fingerprint profiles too)
+python -m dev.setup_accounts dev/data/accounts.json
 
-# Edit dev/data/accounts.json with real usernames/passwords
-
-# Create accounts (uses residential proxy + claude -p for CAPTCHAs)
+# Create Wikipedia accounts (uses residential proxy + claude -p for CAPTCHAs)
 python -m dev.account_creator --create-all
 
 # Or create one at a time
 python -m dev.account_creator --create CarlosWikiES
 ```
 
-**CAPTCHA handling**: The account creator extracts the CAPTCHA image and uses `claude -p` (with vision) to read it. Success rate is ~50% per attempt; the creator retries up to 3 times.
+**CAPTCHA handling**: The account creator extracts the CAPTCHA image and uses `claude -p` (with vision) to read it. Success rate is ~50% per attempt.
 
-**If residential proxy KYC is pending**: Create accounts from the server's direct IP (no proxy). The IP used for creation is stored in `connection_config` in the DB.
+### Per-account proxy config
 
-### Connection types per account
+Each account has a fixed residential proxy location stored in `connection_config` (JSON) in the DB. The proxy is used for both account creation AND daily edits, ensuring a consistent geographic identity.
 
-Each account stores its `connection_type` in the database:
-- `direct`: No proxy/VPN (server's real IP)
-- `proxy`: Bright Data residential proxy with sticky session (`-session-{username}` for same IP)
-- `vpn`: WireGuard VPN (one .conf per account)
-
-Bright Data proxy username format:
+`accounts.json` format:
+```json
+{"username": "...", "password": "...", "proxy": {"country": "MX", "region": "jalisco", "city": "guadalajara"}}
 ```
-brd-customer-hl_fe24b9ed-zone-residential_proxy1-country-{cc}-session-{username}
+
+Rayobyte proxy format — geo params go in the **password**:
 ```
-Countries: `mx`, `es`, `ar`, `cl`, `pe`, `co`
+username: hallthisis_gmail_com
+password: {PROXY_PASS}-country-{CC}[-region-{R}][-city-{C}][-session-{username}]
+```
+
+Working locations (tested 2026-05-15):
+- MX: nuevo_león, jalisco/guadalajara, puebla/puebla_city, baja_california/tijuana, querétaro, quintana_roo
+- CO: antioquia/medellín, valle_del_cauca_department/cali, country-only
+- AR: cordoba, country-only
+- CL: santiago_metropolitan/santiago
+- PE: lima_province
 
 ## Typo Finding Strategy
 

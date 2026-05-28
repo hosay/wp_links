@@ -31,7 +31,13 @@ from dev.link_finder import (
     fetch_wikitext_batch_api,
     extract_broken_urls_v2,
 )
-from dev.link_replacer import find_live_replacement, get_usage_stats, reset_usage_stats
+from dev.link_replacer import (
+    find_live_replacement,
+    get_usage_stats,
+    reset_usage_stats,
+    verify_replacement_live,
+    verify_replacement_content,
+)
 from dev.link_validator import classify_confidence
 from dev.slack_notifier import format_discovery_report, send_notification
 
@@ -130,8 +136,31 @@ def discover_broken_links(conn, max_articles: int = 100) -> dict:
         result = find_live_replacement(url, page_title=title)
 
         if result:
+            replacement_url = result["replacement_url"]
+
+            # Tier 1: Verify replacement URL is actually live
+            liveness = verify_replacement_live(replacement_url)
+            if not liveness["alive"]:
+                reason = "soft 404" if liveness["soft_404"] else "dead/tiny"
+                log.info("  Replacement rejected (%s): %s", reason, replacement_url[:80])
+                mark_link_searched(conn, link["id"], f"rejected:{reason}:{replacement_url[:80]}")
+                continue
+
+            # Tier 2: Gemini content relevance check
+            content_check = verify_replacement_content(
+                replacement_url=replacement_url,
+                replacement_text=liveness.get("text", ""),
+                article_title=title,
+                original_url=url,
+            )
+            if not content_check["is_relevant"]:
+                log.info("  Replacement rejected (irrelevant content): %s — %s",
+                         replacement_url[:80], content_check.get("reasoning", "")[:80])
+                mark_link_searched(conn, link["id"], f"rejected:irrelevant:{replacement_url[:80]}")
+                continue
+
             confidence = classify_confidence(
-                url, result["replacement_url"], result["source"],
+                url, replacement_url, result["source"],
                 similarity_score=result.get("similarity_score", 0.0),
             )
 
@@ -141,7 +170,7 @@ def discover_broken_links(conn, max_articles: int = 100) -> dict:
                 "source = ?, similarity_score = ?, wayback_snapshot_url = ?, "
                 "search_query = ?, verified_at = datetime('now') WHERE id = ?",
                 (
-                    result["replacement_url"],
+                    replacement_url,
                     confidence,
                     result["source"],
                     result.get("similarity_score", 0.0),
@@ -159,7 +188,7 @@ def discover_broken_links(conn, max_articles: int = 100) -> dict:
                 stats["medium_confidence"] += 1
 
             log.info("  Found: %s (confidence=%s, source=%s)",
-                     result["replacement_url"], confidence, result["source"])
+                     replacement_url, confidence, result["source"])
         else:
             # Mark as searched so we don't retry next run
             search_note = f"searched:{title}"

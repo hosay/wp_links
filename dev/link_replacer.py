@@ -301,6 +301,127 @@ def score_with_gemini(
         return {"score": 0.0, "reasoning": f"API error: {exc}", "is_same_content": False}
 
 
+# ── Replacement validation gate ──────────────────────────────────────
+
+
+_SOFT_404_PATTERNS = [
+    "404", "not found", "page not found", "no encontrad", "página no encontrada",
+    "ha ocurrido un error", "error 404", "file not found",
+    "coming soon", "under construction", "en construcción",
+    "access denied", "acceso denegado", "forbidden",
+    "en mantenimiento", "maintenance", "temporarily unavailable",
+    "content removed", "contenido eliminado", "expired",
+]
+
+
+def verify_replacement_live(url: str, timeout: int = 12) -> dict:
+    """Tier 1: Verify a replacement URL is actually live.
+
+    Checks:
+    - HTTP status is 200
+    - Not a soft 404 (title/body contains error patterns)
+    - Content is substantial (>1KB)
+
+    Returns {"alive": bool, "soft_404": bool, "title": str, "text": str}.
+    """
+    try:
+        resp = requests.get(url, timeout=timeout, headers=_HEADERS, allow_redirects=True)
+    except Exception as exc:
+        log.info("Replacement liveness check failed for %s: %s", url, exc)
+        return {"alive": False, "soft_404": False, "title": "", "text": ""}
+
+    if resp.status_code != 200:
+        return {"alive": False, "soft_404": False, "title": "", "text": ""}
+
+    text, title = _extract_text_from_html(resp.text)
+
+    # Reject tiny pages (<1KB raw HTML) — likely error stubs
+    if len(resp.text) < 1024:
+        log.info("Replacement rejected (tiny page %d bytes): %s", len(resp.text), url)
+        return {"alive": False, "soft_404": False, "title": title, "text": text}
+
+    # Detect soft 404s in title
+    title_lower = title.lower()
+    for pattern in _SOFT_404_PATTERNS:
+        if pattern in title_lower:
+            log.info("Replacement rejected (soft 404 in title '%s'): %s", title[:60], url)
+            return {"alive": False, "soft_404": True, "title": title, "text": text}
+
+    # Detect soft 404s in early body content (first 500 chars)
+    body_prefix = text[:500].lower()
+    for pattern in _SOFT_404_PATTERNS:
+        if pattern in body_prefix:
+            log.info("Replacement rejected (soft 404 in body): %s", url)
+            return {"alive": False, "soft_404": True, "title": title, "text": text}
+
+    return {"alive": True, "soft_404": False, "title": title, "text": text}
+
+
+def verify_replacement_content(
+    replacement_url: str,
+    replacement_text: str,
+    article_title: str,
+    original_url: str,
+) -> dict:
+    """Tier 2: Use Gemini to verify replacement content is relevant.
+
+    Checks if the replacement page contains content related to the
+    Wikipedia article context, not just a generic index/listing page.
+
+    Returns {"is_relevant": bool, "reasoning": str}.
+    """
+    if not GEMINI_API_KEY:
+        # Can't check without API key — assume relevant (Tier 1 already passed)
+        return {"is_relevant": True, "reasoning": "Gemini API not configured — skipping check"}
+
+    # Truncate to save tokens
+    text_truncated = replacement_text[:1500]
+
+    prompt = (
+        "You are validating a Wikipedia broken link fix. A broken URL in a Spanish Wikipedia "
+        f"article titled \"{article_title}\" is being replaced.\n\n"
+        f"Original (broken) URL: {original_url}\n"
+        f"Replacement URL: {replacement_url}\n\n"
+        f"Replacement page content (truncated):\n{text_truncated}\n\n"
+        "Does the replacement page contain SPECIFIC content that could serve as a valid "
+        "reference/citation for the Wikipedia article? Reject if it's a generic index page, "
+        "homepage, login page, or error page that doesn't contain the specific content "
+        "the original URL was citing.\n\n"
+        "Respond with ONLY a JSON object:\n"
+        '{"is_relevant": true/false, "reasoning": "brief explanation"}'
+    )
+
+    try:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={GEMINI_API_KEY}",
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=20,
+            headers={"Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        _usage_stats["gemini_calls"] += 1
+        usage_meta = data.get("usageMetadata", {})
+        _usage_stats["gemini_input_tokens"] += usage_meta.get("promptTokenCount", 0)
+        _usage_stats["gemini_output_tokens"] += usage_meta.get("candidatesTokenCount", 0)
+
+        text_response = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        if text_response.startswith("```"):
+            text_response = re.sub(r'^```(?:json)?\s*', '', text_response)
+            text_response = re.sub(r'\s*```$', '', text_response)
+
+        import json
+        result = json.loads(text_response)
+        return {
+            "is_relevant": bool(result.get("is_relevant", False)),
+            "reasoning": result.get("reasoning", ""),
+        }
+    except Exception as exc:
+        log.warning("Gemini content verification failed (passing through): %s", exc)
+        # Tier 1 already passed — don't block good fixes on transient API errors
+        return {"is_relevant": True, "reasoning": f"API error (deferred): {exc}"}
+
+
 # ── Redirect validation ──────────────────────────────────────────────
 
 

@@ -34,10 +34,15 @@ def test_discover_broken_links_full_pipeline(db):
         "search_query": '"some distinctive phrase"',
     }
 
+    mock_liveness = {"alive": True, "soft_404": False, "title": "Test", "text": "content"}
+    mock_content = {"is_relevant": True, "reasoning": "matches"}
+
     with patch("dev.discovery.fetch_category_members_api", return_value=mock_category):
         with patch("dev.discovery.fetch_wikitext_batch_api", return_value=mock_wikitext):
             with patch("dev.discovery.find_live_replacement", return_value=mock_replacement):
-                stats = discover_broken_links(db, max_articles=10)
+                with patch("dev.discovery.verify_replacement_live", return_value=mock_liveness):
+                    with patch("dev.discovery.verify_replacement_content", return_value=mock_content):
+                        stats = discover_broken_links(db, max_articles=10)
 
     assert stats["articles_checked"] == 1
     assert stats["broken_urls_found"] == 1

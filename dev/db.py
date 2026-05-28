@@ -4,7 +4,7 @@ Manages accounts, pages, broken_links, and edits tables.
 """
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -92,6 +92,12 @@ def _migrate_schema_v2(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE accounts ADD COLUMN registered INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass
+    # Block tracking: cooldown timestamp and cumulative block count
+    for col, typ in [("blocked_until", "TEXT"), ("block_count", "INTEGER DEFAULT 0")]:
+        try:
+            conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
 
 
@@ -137,6 +143,44 @@ def update_account_state(conn: sqlite3.Connection, username: str, new_state: str
         "UPDATE accounts SET state = ? WHERE username = ?", (new_state, username)
     )
     conn.commit()
+
+
+def mark_account_blocked(conn: sqlite3.Connection, username: str, hours: int = 24) -> None:
+    """Set blocked_until and increment block_count for an account."""
+    blocked_until = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+    conn.execute(
+        "UPDATE accounts SET blocked_until = ?, block_count = COALESCE(block_count, 0) + 1 "
+        "WHERE username = ?",
+        (blocked_until, username),
+    )
+    conn.commit()
+
+
+def get_block_count(conn: sqlite3.Connection, username: str) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(block_count, 0) as bc FROM accounts WHERE username = ?",
+        (username,),
+    ).fetchone()
+    return row["bc"] if row else 0
+
+
+def reassign_proxy(conn: sqlite3.Connection, username: str, new_proxy_config: dict) -> None:
+    """Update an account's proxy configuration."""
+    import json
+    conn.execute(
+        "UPDATE accounts SET connection_config = ? WHERE username = ?",
+        (json.dumps(new_proxy_config), username),
+    )
+    conn.commit()
+
+
+def get_all_account_summaries(conn: sqlite3.Connection) -> list[dict]:
+    """Get per-account summary: username, state, edit_count, registered, last_edit_at."""
+    rows = conn.execute(
+        "SELECT username, state, edit_count, registered, last_edit_at, blocked_until "
+        "FROM accounts ORDER BY edit_count DESC, username"
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def increment_edit_count(conn: sqlite3.Connection, username: str) -> None:
@@ -253,6 +297,20 @@ def mark_link_searched(conn: sqlite3.Connection, broken_link_id: int, query: str
     conn.commit()
 
 
+def mark_link_stale(conn: sqlite3.Connection, broken_link_id: int, reason: str) -> None:
+    """Mark a broken link's replacement as stale (e.g. URL removed from article).
+
+    Clears replacement_url so get_fixable_links() skips it, and records
+    the reason in search_query for diagnostics.
+    """
+    conn.execute(
+        "UPDATE broken_links SET replacement_url = NULL, confidence = NULL, "
+        "search_query = ?, verified_at = ? WHERE id = ?",
+        (f"stale:{reason}", _now(), broken_link_id),
+    )
+    conn.commit()
+
+
 def set_replacement_url(
     conn: sqlite3.Connection,
     broken_link_id: int,
@@ -315,16 +373,21 @@ def get_edits_for_account(conn: sqlite3.Connection, account_id: int) -> list[sql
 
 
 def get_health_metrics(conn: sqlite3.Connection, days: int = 7) -> dict:
-    """Get edit health metrics for the last N days."""
-    from datetime import datetime, timezone, timedelta
+    """Get edit health metrics for the last N days.
+
+    Only counts edits with a terminal status (success/reverted/failed),
+    not pending edits that never completed.
+    """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
-    total = conn.execute(
-        "SELECT COUNT(*) as c FROM edits WHERE attempted_at >= ?", (cutoff,)
+    successful = conn.execute(
+        "SELECT COUNT(*) as c FROM edits WHERE attempted_at >= ? AND status = 'success'",
+        (cutoff,),
     ).fetchone()["c"]
     reverted = conn.execute(
         "SELECT COUNT(*) as c FROM edits WHERE attempted_at >= ? AND status = 'reverted'",
         (cutoff,),
     ).fetchone()["c"]
+    total = successful + reverted
     return {
         "total_7d": total,
         "reverted_7d": reverted,

@@ -182,6 +182,41 @@ def format_discovery_report(
     return "\n".join(parts)
 
 
+def _account_roster_section(account_details: list[dict]) -> list[str]:
+    """Per-account roster showing registration + edit progress."""
+    if not account_details:
+        return []
+
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    lines = ["", "*Account Roster:*"]
+    for acct in account_details:
+        username = acct["username"]
+        state = acct["state"]
+        edits = acct["edit_count"]
+        reg = acct.get("registered", 0)
+        blocked = acct.get("blocked_until")
+
+        if blocked and blocked > now_iso:
+            icon = ":no_entry:"
+            status = "blocked"
+        elif not reg:
+            icon = ":hourglass_flowing_sand:"
+            status = "unregistered"
+        elif state == "active":
+            icon = ":white_check_mark:"
+            status = f"active ({edits} edits)"
+        else:
+            bar = "█" * edits + "░" * (5 - edits)
+            icon = ":hammer_and_wrench:"
+            status = f"warmup {edits}/5 {bar}"
+
+        user = _user_link(username)
+        lines.append(f"• {icon} {user} — {status}")
+    return lines
+
+
 def format_edit_report(
     edits: list,
     accounts_used: list[str],
@@ -189,6 +224,7 @@ def format_edit_report(
     account_summary: dict = None,
     fixable_count: int = 0,
     health: dict = None,
+    account_details: list[dict] = None,
 ) -> str:
     """Format the daily edit cycle report for Slack.
 
@@ -268,6 +304,10 @@ def format_edit_report(
     if account_summary:
         parts.append("")
         parts.extend(_pipeline_section(account_summary, fixable_count))
+
+    # Per-account roster
+    if account_details:
+        parts.extend(_account_roster_section(account_details))
 
     # Cost
     parts.append("")
