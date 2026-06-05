@@ -46,17 +46,59 @@ def load_typo_patterns() -> list[dict]:
         return json.load(f)
 
 
+# Matches URLs in wikitext: bare, inside [], and inside |url=/|urlarchivo= params.
+_URL_RE = re.compile(r'https?://[^\s\]|}<>]+')
+
+
+def _mask_urls(text: str) -> tuple[str, list[tuple[int, int, str]]]:
+    """Replace URLs with neutral placeholders that won't match typo patterns.
+
+    Returns (masked_text, list of (start, end, original_url)) for restoring.
+    """
+    spans = []
+    for m in _URL_RE.finditer(text):
+        spans.append((m.start(), m.end(), m.group()))
+    if not spans:
+        return text, []
+    parts = []
+    prev = 0
+    for start, end, url in spans:
+        parts.append(text[prev:start])
+        # Placeholder same length to preserve positions — uses chars
+        # that never appear in typo patterns
+        parts.append('\x00' * (end - start))
+        prev = end
+    parts.append(text[prev:])
+    return ''.join(parts), spans
+
+
+def _unmask_urls(text: str, spans: list[tuple[int, int, str]]) -> str:
+    """Restore original URLs from placeholders."""
+    if not spans:
+        return text
+    parts = []
+    prev = 0
+    for start, end, url in spans:
+        parts.append(text[prev:start])
+        parts.append(url)
+        prev = end
+    parts.append(text[prev:])
+    return ''.join(parts)
+
+
 def find_typo_in_text(text: str, patterns: list[dict]) -> dict | None:
     """Find the first matching typo pattern in text.
 
     Uses word boundary matching to avoid partial matches.
+    Skips text inside URLs to avoid corrupting links.
     Returns the matching pattern dict or None.
     """
+    masked, _ = _mask_urls(text)
     for pattern in patterns:
         wrong = pattern["wrong"]
         # Word boundary match, case-insensitive
         regex = re.compile(rf'\b{re.escape(wrong)}\b', re.IGNORECASE)
-        if regex.search(text):
+        if regex.search(masked):
             return pattern
     return None
 
@@ -64,8 +106,10 @@ def find_typo_in_text(text: str, patterns: list[dict]) -> dict | None:
 def apply_typo_fix(text: str, wrong: str, correct: str) -> tuple[str, int]:
     """Replace all occurrences of a typo in text, preserving case.
 
+    Skips text inside URLs to avoid corrupting links.
     Returns (fixed_text, replacement_count).
     """
+    masked, spans = _mask_urls(text)
     count = 0
 
     def _replace(match):
@@ -78,7 +122,8 @@ def apply_typo_fix(text: str, wrong: str, correct: str) -> tuple[str, int]:
         return correct
 
     regex = re.compile(rf'\b{re.escape(wrong)}\b', re.IGNORECASE)
-    fixed = regex.sub(_replace, text)
+    fixed = regex.sub(_replace, masked)
+    fixed = _unmask_urls(fixed, spans)
     return fixed, count
 
 

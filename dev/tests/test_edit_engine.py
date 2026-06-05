@@ -67,6 +67,42 @@ def test_apply_typo_fix_preserves_case():
     assert "artículo" in fixed  # Lowercase fixed
 
 
+def test_find_typo_skips_urls(typo_patterns):
+    """Typo patterns must not match inside URLs."""
+    text = (
+        '<ref>[https://www.pagina12.com.ar/40028-el-articulo-principal '
+        '1989: El artículo principal]</ref>'
+    )
+    match = find_typo_in_text(text, typo_patterns)
+    # "articulo" is inside the URL slug — should NOT match
+    assert match is None
+
+
+def test_apply_typo_fix_skips_urls():
+    """apply_typo_fix must not modify text inside URLs."""
+    text = (
+        '<ref>[https://www.pagina12.com.ar/40028-el-articulo-nuevo '
+        'El articulo nuevo]</ref>'
+    )
+    fixed, count = apply_typo_fix(text, "articulo", "artículo")
+    # URL must be unchanged
+    assert "pagina12.com.ar/40028-el-articulo-nuevo" in fixed
+    # Display text should be fixed
+    assert "El artículo nuevo" in fixed
+    assert count == 1
+
+
+def test_apply_typo_fix_skips_template_url_params():
+    """Typo fix must not modify |url= or |urlarchivo= values in templates."""
+    text = (
+        '{{Cita web |url=https://example.com/el-articulo-historica '
+        '|título=El articulo}}'
+    )
+    fixed, count = apply_typo_fix(text, "articulo", "artículo")
+    assert "example.com/el-articulo-historica" in fixed
+    assert count == 1  # only the título value
+
+
 def test_apply_link_fix():
     wikitext = "Ver [http://old.gob.mx/doc informe] para detalles."
     fixed = apply_link_fix(wikitext, "http://old.gob.mx/doc", "http://new.gob.mx/doc")
