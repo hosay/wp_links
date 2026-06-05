@@ -43,6 +43,69 @@ def _type_human(page, selector: str, text: str):
     page.type(selector, text, delay=random.uniform(KEYSTROKE_DELAY_MIN, KEYSTROKE_DELAY_MAX))
 
 
+def _set_ve_preferences(page):
+    """Set VisualEditor preferences via API to suppress the welcome dialog."""
+    try:
+        # Get a CSRF token
+        token_resp = page.evaluate("""
+            fetch('/w/api.php?action=query&meta=tokens&format=json', {credentials: 'same-origin'})
+                .then(r => r.json())
+                .then(d => d.query.tokens.csrftoken)
+        """)
+        if not token_resp:
+            return
+        # Set preferences: hide VE welcome, prefer source editor
+        page.evaluate("""(token) => {
+            const params = new URLSearchParams();
+            params.set('action', 'options');
+            params.set('format', 'json');
+            params.set('optionname', 'visualeditor-hidebetawelcome');
+            params.set('optionvalue', '1');
+            params.set('token', token);
+            fetch('/w/api.php', {method: 'POST', body: params, credentials: 'same-origin'});
+        }""", token_resp)
+        log.info("Set VisualEditor preferences (hide welcome dialog)")
+    except Exception as e:
+        log.warning("Failed to set VE preferences: %s", e)
+
+
+def _dismiss_ve_welcome(page):
+    """Dismiss the VisualEditor welcome dialog if present.
+
+    New Wikipedia accounts see a modal on their first source-editor visit.
+    The dialog intercepts pointer events on the textarea, blocking edits.
+    """
+    dialog = page.query_selector(".ve-init-mw-welcomeDialog.oo-ui-window-active")
+    if not dialog:
+        return
+    log.info("VisualEditor welcome dialog detected — dismissing")
+    # Try the primary action button (usually "Empezar" / "Start")
+    for sel in [
+        '.ve-init-mw-welcomeDialog .oo-ui-flaggedElement-primary button',
+        '.ve-init-mw-welcomeDialog .oo-ui-messageDialog-actions button',
+        '.ve-init-mw-welcomeDialog button',
+    ]:
+        try:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                btn.click()
+                _human_delay(0.5, 1.0)
+                # Verify dialog is gone
+                if not page.query_selector(".ve-init-mw-welcomeDialog.oo-ui-window-active"):
+                    return
+        except Exception:
+            continue
+    # Fallback: force-close via JavaScript
+    try:
+        page.evaluate("""
+            document.querySelectorAll('.ve-init-mw-welcomeDialog.oo-ui-window-active')
+                .forEach(el => el.remove());
+        """)
+        log.info("Removed VisualEditor welcome dialog via JS fallback")
+    except Exception:
+        pass
+
+
 # ── URL builders ──────────────────────────────────────────────────────
 
 
@@ -205,6 +268,8 @@ def login(page, username: str, password: str) -> bool:
 
     if logged_in:
         log.info("Login successful for %s", username)
+        # Disable VisualEditor welcome dialog for future edits
+        _set_ve_preferences(page)
     else:
         log.error("Login failed for %s", username)
     return logged_in
@@ -327,6 +392,10 @@ def save_edit(page, title: str, new_wikitext: str, summary: str) -> bool:
     if not textarea:
         log.error("Cannot edit %s — textarea not found (page may be protected)", title)
         return False
+
+    # Dismiss VisualEditor welcome dialog if it appeared after page load.
+    # New accounts see this modal on their first edit; it blocks the textarea.
+    _dismiss_ve_welcome(page)
 
     # Clear and fill the textarea
     textarea.click()

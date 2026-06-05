@@ -80,7 +80,6 @@
   {"wrong": "acustico", "correct": "acústico", "context": "missing tilde"},
   {"wrong": "armonico", "correct": "armónico", "context": "missing tilde"},
   {"wrong": "melodico", "correct": "melódico", "context": "missing tilde"},
-  {"wrong": "ritmico", "correct": "rítmico", "context": "missing tilde"},
   {"wrong": "sinfonico", "correct": "sinfónico", "context": "missing tilde"},
   {"wrong": "artico", "correct": "ártico", "context": "missing tilde"},
   {"wrong": "atlantico", "correct": "atlántico", "context": "missing tilde"},
