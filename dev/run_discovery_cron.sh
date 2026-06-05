@@ -19,6 +19,6 @@ set -a
 source .env
 set +a
 
-python -m dev.discovery --max-articles 100
+python -m dev.discovery --max-articles 200
 
 echo "$(date -Iseconds) — Discovery cycle finished"

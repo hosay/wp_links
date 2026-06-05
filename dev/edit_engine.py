@@ -135,14 +135,6 @@ def apply_link_fix(wikitext: str, old_url: str, new_url: str) -> str:
 
     Handles single-line and multi-line citation templates.
     """
-    enlace_roto_re = re.compile(
-        r'\s*\{\{enlace roto(?:\s*\|[^}]*)?\}\}',
-        re.IGNORECASE,
-    )
-    url_inaccesible_re = re.compile(
-        r'\s*\{\{URL inaccesible(?:\s*\|[^}]*)?\}\}',
-        re.IGNORECASE,
-    )
     dead_param_patterns = [
         re.compile(r'\s*\|urlmuerta\s*=\s*s[ií]\s*', re.IGNORECASE),
         re.compile(r'\s*\|estado\s*=\s*muerto\s*', re.IGNORECASE),
@@ -150,31 +142,41 @@ def apply_link_fix(wikitext: str, old_url: str, new_url: str) -> str:
         re.compile(r'\s*\|url-status\s*=\s*dead\s*', re.IGNORECASE),
     ]
 
+    # Scoped regexes: only match templates that contain old_url in their params.
+    # Prevents stripping unrelated {{enlace roto}} for other URLs on the same line.
+    esc_url = re.escape(old_url)
+    scoped_enlace_re = re.compile(
+        r'\s*\{\{enlace roto\s*\|[^}]*?' + esc_url + r'[^}]*?\}\}',
+        re.IGNORECASE | re.DOTALL,
+    )
+    scoped_inaccesible_re = re.compile(
+        r'\s*\{\{URL inaccesible\s*\|[^}]*?' + esc_url + r'[^}]*?\}\}',
+        re.IGNORECASE | re.DOTALL,
+    )
+    # Trailing markers: parameterless templates right after old_url
+    trailing_marker_re = re.compile(
+        r'(' + esc_url + r')\s*\{\{(?:enlace roto|URL inaccesible)(?:\s*\|[^}]*)?\}\}',
+        re.IGNORECASE,
+    )
+
     result = wikitext
 
-    # Step 1: Handle {{enlace roto}} / {{URL inaccesible}} on same line as old_url.
-    # If old_url also exists outside the template (e.g. in a [url Title] link),
-    # just remove the template. If old_url is ONLY inside the template (the
-    # template IS the reference), replace it with new_url to avoid leaving
-    # empty <ref></ref> tags.
-    lines = result.split('\n')
-    cleaned_lines = []
-    for line in lines:
-        if old_url in line:
-            stripped = enlace_roto_re.sub('', line)
-            stripped = url_inaccesible_re.sub('', stripped)
-            if old_url in stripped:
-                # URL survives outside the template — safe to just remove
-                line = stripped
+    # Step 1: Remove {{enlace roto/URL inaccesible}} templates containing old_url.
+    # If old_url survives outside the template, just remove the template.
+    # If old_url is ONLY inside the template, replace it with new_url to
+    # avoid leaving empty <ref></ref> tags.
+    for scoped_re in (scoped_enlace_re, scoped_inaccesible_re):
+        if scoped_re.search(result):
+            test_result = scoped_re.sub('', result)
+            if old_url in test_result:
+                result = test_result
             else:
-                # URL only inside template — replace template with new URL
-                line = enlace_roto_re.sub(f' {new_url}', line)
-                line = url_inaccesible_re.sub(f' {new_url}', line)
-        cleaned_lines.append(line)
-    result = '\n'.join(cleaned_lines)
+                result = scoped_re.sub(f' {new_url}', result)
+
+    # Step 1b: Remove trailing parameterless markers (e.g. "old_url {{enlace roto}}")
+    result = trailing_marker_re.sub(r'\1', result)
 
     # Step 2: Strip dead-link params from the enclosing citation template
-    # (must run before enlace_roto removal so old_url is still findable)
     pos = result.find(old_url)
     if pos != -1:
         tmpl = _find_enclosing_template(result, pos)
@@ -186,20 +188,7 @@ def apply_link_fix(wikitext: str, old_url: str, new_url: str) -> str:
                     block = pat.sub('', block)
                 result = result[:start] + block + result[end:]
 
-    # Step 3: Remove {{enlace roto |url=<old_url>}} even on a different line.
-    # Same logic: replace with new_url if it's the sole reference content.
-    specific_enlace_re = re.compile(
-        r'\s*\{\{enlace roto\s*\|[^}]*?' + re.escape(old_url) + r'[^}]*?\}\}',
-        re.IGNORECASE | re.DOTALL,
-    )
-    if specific_enlace_re.search(result):
-        test_result = specific_enlace_re.sub('', result)
-        if old_url in test_result:
-            result = test_result
-        else:
-            result = specific_enlace_re.sub(f' {new_url}', result)
-
-    # Step 4: Replace the URL
+    # Step 3: Replace the URL
     result = result.replace(old_url, new_url)
 
     return result

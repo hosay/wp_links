@@ -543,7 +543,7 @@ def run(dry_run: bool = False):
     # Phase 1: Register pending accounts (separate from editing)
     registration_records = []
     if not dry_run:
-        registration_records = _register_pending_accounts(conn, max_register=3)
+        registration_records = _register_pending_accounts(conn, max_register=1)
 
     # Phase 2: Select registered accounts for editing
     daily_count = 7
@@ -625,13 +625,22 @@ def run(dry_run: bool = False):
                 edit_type = determine_edit_type(account["state"], account["edit_count"])
                 log.info("Edit type for %s: %s", username, edit_type)
 
-                # Execute edit
+                # Execute edit — active accounts fall back to typo/spacing
+                # when no fixable links are available
                 if edit_type == "typo":
                     result = execute_typo_edit(page, conn, account)
                 elif edit_type == "spacing":
                     result = execute_spacing_edit(page, conn, account)
                 else:
                     result = execute_link_fix(page, conn, account)
+                    if not result.get("success") and "No fixable" in result.get("error", ""):
+                        fallback_type = "typo" if account["edit_count"] % 2 == 0 else "spacing"
+                        log.info("No fixable links — falling back to %s edit for %s", fallback_type, username)
+                        edit_type = fallback_type
+                        if fallback_type == "typo":
+                            result = execute_typo_edit(page, conn, account)
+                        else:
+                            result = execute_spacing_edit(page, conn, account)
 
                 # Record for reporting
                 edit_time = datetime.now(timezone.utc).strftime("%H:%M")

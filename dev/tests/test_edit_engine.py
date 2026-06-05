@@ -211,6 +211,24 @@ def test_apply_link_fix_enlace_roto_sole_ref_url_param():
     assert "<ref></ref>" not in fixed
 
 
+def test_apply_link_fix_same_line_unrelated_enlace_roto_preserved():
+    """Fixing URL-A must not strip an {{enlace roto}} template for URL-B on the same line."""
+    wikitext = (
+        '<ref>{{Cita web |url=http://example.com/a |título=A}}</ref>'
+        '<ref>{{enlace roto|1=http://example.com/b |2=http://example.com/b '
+        '|bot=InternetArchiveBot }}</ref>'
+        '<ref>http://example.com/c</ref>'
+    )
+    # Fix URL-C (bare URL) — should NOT touch the enlace roto for URL-B
+    fixed = apply_link_fix(wikitext, "http://example.com/c", "http://example.com/c-new")
+    assert "http://example.com/c-new" in fixed
+    # The enlace roto template for URL-B must still be there
+    assert "enlace roto" in fixed
+    assert "example.com/b" in fixed
+    # No empty refs
+    assert "<ref></ref>" not in fixed
+
+
 def test_pick_typo_edit_summary():
     s = pick_typo_edit_summary()
     assert isinstance(s, str)

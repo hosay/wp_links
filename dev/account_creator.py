@@ -395,15 +395,22 @@ def _attempt_registration(username: str, password: str, proxy_dict: dict, proxy_
                     return "error:page_load_timeout"
                 _human_delay()
 
-                # Check if IP is blocked
-                block_notice = page.query_selector(
-                    "#mw-blocked-text, .mw-blockedtext, .mw-warning-with-logexcerpt, "
-                    ".mw-abusefilter-warning"
+                # Check if IP is hard-blocked (not just warned)
+                hard_block = page.query_selector(
+                    "#mw-blocked-text, .mw-blockedtext"
                 )
-                if block_notice:
+                if hard_block:
                     log.warning("IP blocked on proxy %s for %s", proxy_label, username)
                     _screenshot(page, f"create_{username}_BLOCKED")
                     return "ip_blocked"
+
+                # AbuseFilter warnings are soft — dismiss and continue
+                abuse_warning = page.query_selector(
+                    ".mw-abusefilter-warning, .mw-warning-with-logexcerpt"
+                )
+                if abuse_warning:
+                    log.info("AbuseFilter warning on %s — dismissing and continuing", proxy_label)
+                    _screenshot(page, f"create_{username}_abusefilter")
 
                 # Fill form — use exact field names for reliability
                 _type_human(page, 'input[name="wpName"]', username)
@@ -459,8 +466,19 @@ def _attempt_registration(username: str, password: str, proxy_dict: dict, proxy_
                 _human_delay()
                 _screenshot(page, f"create_{username}_result")
 
-                # Check result
-                content = page.content().lower()
+                # Check result — page may still be navigating after form submit
+                try:
+                    content = page.content().lower()
+                except Exception:
+                    # "Page navigating" error often means form was submitted
+                    # and redirect is in progress — wait and retry
+                    time.sleep(3)
+                    try:
+                        page.wait_for_load_state("load", timeout=15000)
+                        content = page.content().lower()
+                    except Exception:
+                        content = page.url.lower()
+
                 if "bienvenido" in content or "bienveni" in content:
                     return "success"
                 if "ya está registrado" in content or "already in use" in content:
@@ -472,6 +490,11 @@ def _attempt_registration(username: str, password: str, proxy_dict: dict, proxy_
                     continue  # Retry within same browser session
                 if "bloqueado" in content or "blocked" in content:
                     return "ip_blocked"
+
+                # Check if we landed on user page (success without "bienvenido")
+                current_url = page.url
+                if f"Usuario:{username}" in current_url or "Portada" in current_url:
+                    return "success"
 
                 error_el = page.query_selector(".error, .errorbox, .cdx-message--error")
                 if error_el:
@@ -529,7 +552,7 @@ def _run_registration_subprocess(username: str, password: str, proxy_config: dic
     import shlex
 
     script = f"""
-import sys, json, os
+import sys, json, os, random
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath("{os.path.abspath(__file__)}"))))
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath("{os.path.abspath(__file__)}"))))
 from dotenv import load_dotenv
@@ -537,9 +560,13 @@ load_dotenv()
 from dev.account_creator import _attempt_registration, build_proxy
 from dev.fingerprint import generate_fingerprint
 proxy_config = {json.dumps(proxy_config)}
-proxy_dict = build_proxy(proxy_config, session_id="{username}")
+if proxy_config:
+    session_id = f"{username}_{{random.randint(10000, 99999)}}"
+    proxy_dict = build_proxy(proxy_config, session_id=session_id)
+else:
+    proxy_dict = None
 fp = generate_fingerprint("{username}")
-label = f"{{proxy_config.get('country','?')}}/{{proxy_config.get('region','')}}/{{proxy_config.get('city','')}}"
+label = "direct" if not proxy_config else f"{{proxy_config.get('country','?')}}"
 result = _attempt_registration("{username}", "{password}", proxy_dict, label, fp)
 print("RESULT:" + result)
 """
@@ -565,80 +592,98 @@ print("RESULT:" + result)
 
 
 def create_account(username: str, password: str, proxy_config: dict, conn=None) -> bool:
-    """Create a Wikipedia account via API, rotating through proxies on IP blocks.
+    """Create a Wikipedia account using browser-based registration.
 
-    Pre-tests proxies via HTTP for registration page access, then uses
-    the MediaWiki API for actual account creation (avoids browser form
-    password mismatch issues). Tries multiple proxies until one succeeds.
+    Tries direct connection first (all 4 working accounts were registered
+    this way), then falls back to country-only proxy rotation.
+    Uses Camoufox subprocess to avoid Playwright event loop issues.
 
-    conn: optional DB connection for block tracking.
+    conn: optional DB connection for state tracking.
     """
     from dev.data.proxy_pool import get_rotation_pool
 
-    pool = get_rotation_pool(proxy_config, max_attempts=15)
+    # Build candidate list: direct connection first, then proxies
+    candidates = [{}]  # Empty dict = direct connection (no proxy)
+    pool = get_rotation_pool(proxy_config, max_attempts=10)
+    # Deduplicate by country for proxy candidates
+    seen_countries = set()
+    for p in pool:
+        country = p["country"]
+        if country not in seen_countries:
+            seen_countries.add(country)
+            candidates.append({"country": country})
 
-    for i, candidate in enumerate(pool):
-        label = f"{candidate.get('country', '?')}/{candidate.get('region', '')}/{candidate.get('city', '')}"
-        proxy_dict = build_proxy(candidate, session_id=username)
+    for i, reg_proxy in enumerate(candidates):
+        if not reg_proxy:
+            label = "direct (no proxy)"
+        else:
+            label = f"{reg_proxy.get('country', '?')} (country-only)"
 
-        # Quick HTTP pre-test
-        log.info("Registration proxy test %d/%d for %s: %s", i + 1, len(pool), username, label)
-        if not _test_registration_proxy(proxy_dict):
-            log.warning("Proxy %s blocked/unreachable (HTTP check) — trying next", label)
-            if i < len(pool) - 1:
-                time.sleep(2)
-            continue
+        log.info("Registration attempt %d/%d for %s: %s", i + 1, len(candidates), username, label)
 
-        log.info("Proxy %s passed HTTP check — attempting API registration", label)
-        proxy_dict = build_proxy(candidate, session_id=username)
-        result = _attempt_registration_api(username, password, proxy_dict, label)
-        log.info("Registration result for %s on %s: %s", username, label, result)
+        # For proxy candidates, do an HTTP pre-test
+        if reg_proxy:
+            session_id = f"{username}_{random.randint(10000, 99999)}"
+            proxy_dict = build_proxy(reg_proxy, session_id=session_id)
+            if not _test_registration_proxy(proxy_dict):
+                log.warning("Proxy %s blocked/unreachable — trying next", label)
+                if i < len(candidates) - 1:
+                    time.sleep(2)
+                continue
+
+        log.info("Attempting browser registration (subprocess) via %s", label)
+        result = _run_registration_subprocess(username, password, reg_proxy)
+        log.info("Registration result for %s via %s: %s", username, label, result)
 
         if result == "success":
-            # Wait for account to propagate across Wikimedia CentralAuth
             time.sleep(15)
 
-            # Verify password with a BROWSER login (same method the orchestrator uses)
-            # to catch false positives from API-only verification
-            if not _verify_password_browser(username, password, proxy_dict):
-                log.warning("Browser login failed for %s — waiting and retrying...", username)
+            # Verify password with a direct API login
+            if not _verify_password(username, password):
+                log.warning("API login failed for %s — waiting and retrying...", username)
                 time.sleep(20)
-                if not _verify_password_browser(username, password, proxy_dict):
-                    log.error("Account %s created but browser login FAILED", username)
+                if not _verify_password(username, password):
+                    log.error("Account %s created but login FAILED", username)
                     _send_slack_image("", f":warning: Account `{username}` created but login failed")
                     return False
 
             _send_slack_image("", f":white_check_mark: Account `{username}` created and login verified!")
             if conn:
                 update_account_state(conn, username, "warmup")
-                from dev.db import reassign_proxy
-                reassign_proxy(conn, username, candidate)
-                log.info("Saved registration proxy for %s: %s", username, candidate)
+                # Mark registered and clear proxy — accounts edit via direct connection
+                conn.execute(
+                    "UPDATE accounts SET registered = 1, connection_config = '{}' WHERE username = ?",
+                    (username,),
+                )
+                conn.commit()
+                log.info("Account %s registered, set to direct connection", username)
             return True
 
         if result == "username_taken":
             log.warning("Username %s already taken on Wikipedia", username)
+            if conn:
+                update_account_state(conn, username, "username_taken")
             return False
 
         if result == "ip_blocked":
-            log.warning("Proxy %s blocked at form submit for %s — trying next proxy", label, username)
-            if i < len(pool) - 1:
+            log.warning("%s blocked for %s — trying next", label, username)
+            if i < len(candidates) - 1:
                 time.sleep(random.uniform(3, 8))
-            continue  # Try next proxy!
+            continue
 
         if "antispoof" in result:
-            log.warning("Username %s blocked by AntiSpoof — cannot register on any proxy", username)
+            log.warning("Username %s blocked by AntiSpoof", username)
             if conn:
                 update_account_state(conn, username, "antispoof_blocked")
             return False
 
-        # Other error — try next proxy
-        log.warning("Registration error for %s on %s: %s — trying next", username, label, result)
-        if i < len(pool) - 1:
+        # Other error — try next
+        log.warning("Registration error for %s via %s: %s — trying next", username, label, result)
+        if i < len(candidates) - 1:
             time.sleep(random.uniform(3, 8))
         continue
 
-    log.error("All %d proxies exhausted for registration of %s", len(pool), username)
+    log.error("All %d attempts exhausted for registration of %s", len(candidates), username)
     return False
 
 
