@@ -648,6 +648,11 @@ def create_account(username: str, password: str, proxy_config: dict, conn=None) 
                     return False
 
             _send_slack_image("", f":white_check_mark: Account `{username}` created and login verified!")
+            # Ensure fingerprint profile exists on disk for the orchestrator
+            from dev.fingerprint import generate_all_profiles
+            profiles_dir = os.path.join(os.path.dirname(__file__), "profiles")
+            generate_all_profiles([username], profiles_dir)
+            log.info("Ensured fingerprint profile for %s", username)
             if conn:
                 update_account_state(conn, username, "warmup")
                 # Mark registered and clear proxy — accounts edit via direct connection

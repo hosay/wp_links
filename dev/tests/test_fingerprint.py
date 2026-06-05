@@ -61,6 +61,22 @@ def test_load_fingerprint(profiles_dir):
     assert "os" in fp
 
 
+def test_load_fingerprint_auto_generates_missing(profiles_dir):
+    """load_fingerprint should auto-generate the profile if missing on disk."""
+    # No profile generated yet — should auto-create it
+    fp = load_fingerprint("editor_missing", profiles_dir)
+    assert isinstance(fp, dict)
+    assert "os" in fp
+    # File should now exist on disk
+    fp_path = os.path.join(profiles_dir, "editor_missing", "fingerprint.json")
+    assert os.path.exists(fp_path)
+    # Browser dir should also exist
+    browser_dir = os.path.join(profiles_dir, "editor_missing", "browser")
+    assert os.path.isdir(browser_dir)
+    # Result should match deterministic generation
+    assert fp == generate_fingerprint("editor_missing")
+
+
 def test_all_20_fingerprints_are_unique(profiles_dir):
     usernames = [f"editor{i}" for i in range(20)]
     generate_all_profiles(usernames, profiles_dir)

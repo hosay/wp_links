@@ -92,7 +92,13 @@ def generate_all_profiles(usernames: list[str], profiles_dir: str) -> None:
 
 
 def load_fingerprint(username: str, profiles_dir: str) -> dict:
-    """Load a previously generated fingerprint config."""
+    """Load a fingerprint config, auto-generating if missing on disk."""
     fp_path = os.path.join(profiles_dir, username, "fingerprint.json")
+    if not os.path.exists(fp_path):
+        import logging
+        logging.getLogger(__name__).warning(
+            "Fingerprint missing for %s — generating on-the-fly", username
+        )
+        generate_all_profiles([username], profiles_dir)
     with open(fp_path) as f:
         return json.load(f)
