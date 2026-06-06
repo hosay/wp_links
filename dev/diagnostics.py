@@ -50,7 +50,7 @@ def run_diagnostic(
     try:
         result = subprocess.run(
             ["claude", "-p", prompt, "--allowed-tools", "Bash",
-             "--dangerously-skip-permissions"],
+             "--permission-mode", "auto", "--max-turns", "3"],
             capture_output=True,
             text=True,
             timeout=DIAGNOSTIC_TIMEOUT,
