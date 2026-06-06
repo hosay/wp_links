@@ -31,7 +31,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 BASE_URL = "https://es.wikipedia.org"
 SCREENSHOTS_DIR = "dev/data/account_screenshots"
 ACCOUNTS_FILE = os.path.join(os.path.dirname(__file__), "data", "accounts.json")
-WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 
 # Rayobyte residential proxy — geo params appended to password
 PROXY_HOST = os.environ.get("RAYOBYTE_PROXY_HOST", "la.residential.rayobyte.com")
@@ -211,23 +210,6 @@ def _screenshot(page, name: str) -> str:
     return path
 
 
-def _send_slack_image(image_path: str, message: str):
-    """Send a message with image to Slack via webhook."""
-    if not WEBHOOK_URL:
-        log.warning("No Slack webhook — can't send CAPTCHA")
-        return
-    payload = {"text": message}
-    try:
-        http_requests.post(
-            WEBHOOK_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=10,
-        )
-    except Exception as e:
-        log.warning("Slack send failed: %s", e)
-
-
 def _extract_captcha_image(page) -> str | None:
     """Extract the CAPTCHA image and save it. Returns path or None."""
     captcha_img = page.query_selector(".fancycaptcha-image img, #mw-createacct-captcha-area img")
@@ -250,7 +232,7 @@ def _extract_captcha_image(page) -> str | None:
 
 def _handle_ip_block(username: str, proxy_config: dict, conn=None):
     """Handle an IP block: update DB state, escalate proxy if needed."""
-    _send_slack_image("", f":no_entry: IP blocked for `{username}` on proxy `{proxy_config}`")
+    log.warning("IP blocked for %s on proxy %s", username, proxy_config)
     if conn is None:
         return
     from dev.db import mark_account_blocked, get_block_count, reassign_proxy
@@ -264,7 +246,7 @@ def _handle_ip_block(username: str, proxy_config: dict, conn=None):
         if fallback:
             reassign_proxy(conn, username, fallback)
             log.info("Reassigned %s proxy to %s after %d blocks", username, fallback, block_count + 1)
-            _send_slack_image("", f":arrows_counterclockwise: Reassigned `{username}` proxy to `{fallback}`")
+            log.info("Reassigned %s proxy to fallback %s", username, fallback)
 
 
 def _attempt_registration_api(username: str, password: str, proxy_dict: dict, proxy_label: str) -> str:
@@ -644,10 +626,9 @@ def create_account(username: str, password: str, proxy_config: dict, conn=None) 
                 time.sleep(20)
                 if not _verify_password(username, password):
                     log.error("Account %s created but login FAILED", username)
-                    _send_slack_image("", f":warning: Account `{username}` created but login failed")
                     return False
 
-            _send_slack_image("", f":white_check_mark: Account `{username}` created and login verified!")
+            log.info("Account %s created and login verified", username)
             # Ensure fingerprint profile exists on disk for the orchestrator
             from dev.fingerprint import generate_all_profiles
             profiles_dir = os.path.join(os.path.dirname(__file__), "profiles")
@@ -779,11 +760,6 @@ def create_all_accounts():
             time.sleep(delay)
 
     log.info("Done: %d created, %d failed out of %d", created, failed, len(accounts))
-    _send_slack_image(
-        "",
-        f":chart_with_upwards_trend: *Account creation complete*\n"
-        f"Created: {created} | Failed: {failed} | Total: {len(accounts)}"
-    )
 
 
 def explore_registration():

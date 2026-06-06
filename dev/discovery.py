@@ -22,8 +22,6 @@ from dev.db import (
     add_broken_link,
     set_replacement_url,
     get_broken_links_needing_replacement,
-    get_fixable_links,
-    get_account_pipeline_summary,
     mark_link_searched,
 )
 from dev.link_finder import (
@@ -39,7 +37,6 @@ from dev.link_replacer import (
     verify_replacement_content,
 )
 from dev.link_validator import classify_confidence
-from dev.slack_notifier import format_discovery_report, send_notification
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -218,14 +215,6 @@ def run(max_articles: int = 100):
     log.info("API usage — Tavily: %d searches, Gemini: %d calls (%d/%d tokens)",
              usage["tavily_searches"], usage["gemini_calls"],
              usage["gemini_input_tokens"], usage["gemini_output_tokens"])
-
-    # Send Slack report
-    webhook_url = os.environ.get("SLACK_WEBHOOK_URL", "")
-    fixable = get_fixable_links(conn)
-    account_summary = get_account_pipeline_summary(conn)
-    report = format_discovery_report(stats, usage, fixable, account_summary=account_summary)
-    log.info("Sending Slack report...")
-    send_notification(report, webhook_url)
 
     conn.close()
     return stats

@@ -62,7 +62,8 @@ def _set_ve_preferences(page):
             params.set('optionname', 'visualeditor-hidebetawelcome');
             params.set('optionvalue', '1');
             params.set('token', token);
-            fetch('/w/api.php', {method: 'POST', body: params, credentials: 'same-origin'});
+            return fetch('/w/api.php', {method: 'POST', body: params, credentials: 'same-origin'})
+                .then(r => r.json());
         }""", token_resp)
         log.info("Set VisualEditor preferences (hide welcome dialog)")
     except Exception as e:
@@ -74,10 +75,21 @@ def _dismiss_ve_welcome(page):
 
     New Wikipedia accounts see a modal on their first source-editor visit.
     The dialog intercepts pointer events on the textarea, blocking edits.
+    Polls for the dialog since it may appear asynchronously after page load.
     """
-    dialog = page.query_selector(".ve-init-mw-welcomeDialog.oo-ui-window-active")
+    dialog_sel = ".ve-init-mw-welcomeDialog.oo-ui-window-active"
+
+    # Poll for the dialog — it loads asynchronously and may not be present yet
+    dialog = None
+    for _ in range(10):  # 10 x 500ms = 5s max
+        dialog = page.query_selector(dialog_sel)
+        if dialog:
+            break
+        time.sleep(0.5)
+
     if not dialog:
         return
+
     log.info("VisualEditor welcome dialog detected — dismissing")
     # Try the primary action button (usually "Empezar" / "Start")
     for sel in [
@@ -89,18 +101,19 @@ def _dismiss_ve_welcome(page):
             btn = page.query_selector(sel)
             if btn and btn.is_visible():
                 btn.click()
-                _human_delay(0.5, 1.0)
-                # Verify dialog is gone
-                if not page.query_selector(".ve-init-mw-welcomeDialog.oo-ui-window-active"):
+                time.sleep(0.5)
+                if not page.query_selector(dialog_sel):
                     return
         except Exception:
             continue
+
     # Fallback: force-close via JavaScript
     try:
         page.evaluate("""
             document.querySelectorAll('.ve-init-mw-welcomeDialog.oo-ui-window-active')
                 .forEach(el => el.remove());
         """)
+        time.sleep(0.5)
         log.info("Removed VisualEditor welcome dialog via JS fallback")
     except Exception:
         pass

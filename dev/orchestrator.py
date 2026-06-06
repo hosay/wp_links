@@ -40,7 +40,6 @@ from dev.db import (
     mark_link_stale,
     reassign_proxy,
 )
-from dev.diagnostics import run_diagnostic
 from dev.edit_engine import (
     load_typo_patterns,
     find_typo_in_text,
@@ -65,8 +64,6 @@ from dev.link_replacer import get_usage_stats, reset_usage_stats
 from dev.slack_notifier import (
     format_daily_summary,
     format_edit_report,
-    format_error_message,
-    format_diagnostic_message,
     send_notification,
 )
 from dev.wiki_browser import (
@@ -475,6 +472,15 @@ def _register_pending_accounts(conn, max_register: int = 6) -> list[dict]:
     if not unregistered:
         return []
 
+    # Registration cooldown: skip if recent attempts all failed (IP blocked everywhere)
+    recent_failures = conn.execute(
+        "SELECT COUNT(*) FROM accounts WHERE state IN ('username_taken', 'password_mismatch', "
+        "'antispoof_blocked', 'password_lost') AND created_at > datetime('now', '-24 hours')"
+    ).fetchone()[0]
+    if recent_failures > 0:
+        log.info("Registration cooldown active (%d recent failures) — skipping", recent_failures)
+        return []
+
     random.shuffle(unregistered)
     to_register = unregistered[:max_register]
     records = []
@@ -551,11 +557,6 @@ def run(dry_run: bool = False):
 
     if not accounts:
         log.error("No eligible accounts — aborting")
-        if not registration_records:
-            send_notification(
-                ":warning: *Wikipedia Link Fixer* — No eligible accounts for today's run",
-                WEBHOOK_URL,
-            )
         return
 
     accounts_used = []
@@ -592,10 +593,6 @@ def run(dry_run: bool = False):
                     "revision_id": None,
                     "error_message": error_msg,
                 })
-                send_notification(
-                    format_error_message(username, error_msg, "proxy_exhaustion"),
-                    WEBHOOK_URL,
-                )
                 continue
 
             # Persist working proxy if it differs from the account's stored one
@@ -685,30 +682,20 @@ def run(dry_run: bool = False):
                 else:
                     error = result.get("error", "Unknown error")
                     log.error("Edit failed for %s: %s", username, error)
-                    send_notification(
-                        format_error_message(username, error, edit_type),
-                        WEBHOOK_URL,
-                    )
 
                 accounts_used.append(username)
 
         except Exception as exc:
-            error_str = str(exc)
             log.exception("Error processing account %s", username)
-            send_notification(
-                format_error_message(username, error_str, "unknown"),
-                WEBHOOK_URL,
-            )
-
-            # Run diagnostics
-            analysis = run_diagnostic(
-                username, "unknown", error_str,
-                "N/A",
-            )
-            send_notification(
-                format_diagnostic_message(username, analysis),
-                WEBHOOK_URL,
-            )
+            edit_records.append({
+                "account": username,
+                "time": datetime.now(timezone.utc).strftime("%H:%M"),
+                "edit_type": "unknown",
+                "title": "N/A",
+                "status": "failed",
+                "revision_id": None,
+                "error_message": str(exc)[:200],
+            })
 
         # Random delay between accounts (1-90 min) for organic timing
         if i < len(accounts) - 1:
